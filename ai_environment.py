@@ -6,6 +6,8 @@ import pickle
 import copy
 import time
 import pygame
+from enum import Enum
+
 
 # ============================================================================
 # NEURAL NETWORK
@@ -13,6 +15,392 @@ import pygame
 
 input_size = 14
 output_size = 6
+
+class ActivationType(Enum):
+    """Available activation function types."""
+    TANH = "tanh"
+    RELU = "relu"
+    SIGMOID = "sigmoid"
+    LEAKY_RELU = "leaky_relu"
+    SWISH = "swish"
+    LINEAR = "linear"
+
+class ActivationFunctions:
+    """Collection of activation functions and their derivatives."""
+    
+    @staticmethod
+    def activate(x: np.ndarray, activation_type: ActivationType) -> np.ndarray:
+        """Apply activation function."""
+        if activation_type == ActivationType.TANH:
+            return np.tanh(x)
+        elif activation_type == ActivationType.RELU:
+            return np.maximum(0, x)
+        elif activation_type == ActivationType.SIGMOID:
+            return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+        elif activation_type == ActivationType.LEAKY_RELU:
+            return np.where(x > 0, x, x * 0.01)
+        elif activation_type == ActivationType.SWISH:
+            return x * (1 / (1 + np.exp(-np.clip(x, -500, 500))))
+        elif activation_type == ActivationType.LINEAR:
+            return x
+        else:
+            return np.tanh(x)  # Default
+        
+class RecurrentNeuralNetwork:
+    """
+    Recurrent neural network with reservoir computing architecture.
+    Creates a 'soup of neurons' with recurrent connections.
+    """
+    
+    def __init__(self, input_size: int, reservoir_size: int, output_size: int,
+                 spectral_radius: float = 0.9, sparsity: float = 0.1, input_scaling: float = 1.0):
+        """
+        Initialize a recurrent neural network.
+        
+        Args:
+            input_size: Number of input neurons
+            reservoir_size: Size of recurrent reservoir layer
+            output_size: Number of output neurons
+            spectral_radius: Controls stability (0.9 = good default)
+            sparsity: How sparse reservoir connections are (0.1 = 10% connected)
+            input_scaling: Scaling factor for input weights
+        """
+        self.input_size = input_size
+        self.reservoir_size = reservoir_size
+        self.output_size = output_size
+        self.spectral_radius = spectral_radius
+        self.sparsity = sparsity
+        
+        # Reservoir state (neuron activations)
+        self.reservoir_state = np.zeros(reservoir_size)
+        
+        # Input -> Reservoir weights (UPDATED: add sparsity mask)
+        self.input_weights = np.random.randn(input_size, reservoir_size) * input_scaling
+        # Make 50% of input connections zero (allows evolution to add connections where needed)
+        input_mask = np.random.random((input_size, reservoir_size)) < 0.5
+        self.input_weights *= input_mask
+        
+        # Reservoir -> Reservoir weights (the "soup")
+        self.reservoir_weights = self._initialize_reservoir_weights()
+        
+        # Reservoir -> Output weights (UPDATED: start with more connections)
+        self.output_weights = np.random.randn(reservoir_size, output_size) * 0.3
+        # Start with 30% of reservoir neurons connected to each output
+        # This gives outputs more information to work with initially
+        output_mask = np.random.random((reservoir_size, output_size)) < 0.3
+        self.output_weights *= output_mask
+        
+        self.output_bias = np.random.randn(output_size) * 0.5
+        
+        # Activation functions for each reservoir neuron
+        self.reservoir_activations = [
+            random.choice(list(ActivationType)) 
+            for _ in range(reservoir_size)
+        ]
+        
+        # Output activation functions
+        self.output_activations = [ActivationType.TANH] * output_size
+
+        self.last_input = None
+    
+    def _initialize_reservoir_weights(self) -> np.ndarray:
+        """
+        Initialize sparse recurrent reservoir weights with controlled spectral radius.
+        This creates the 'neural soup' effect.
+        """
+        # Create sparse random matrix
+        W = np.random.randn(self.reservoir_size, self.reservoir_size)
+        
+        # Apply sparsity
+        mask = np.random.rand(self.reservoir_size, self.reservoir_size) < self.sparsity
+        W = W * mask
+        
+        # Scale by spectral radius for stability
+        eigenvalues = np.linalg.eigvals(W)
+        max_eigenvalue = np.max(np.abs(eigenvalues))
+        if max_eigenvalue > 0:
+            W = W * (self.spectral_radius / max_eigenvalue)
+        
+        return W
+    
+    def forward(self, inputs: np.ndarray, leak_rate: float = 0.3) -> np.ndarray:
+        """
+        Forward pass through recurrent network.
+        
+        Args:
+            inputs: Input vector
+            leak_rate: How much previous state affects current (0.3 = 30% leak)
+            
+        Returns:
+            Output vector
+        """
+
+        self.last_input = inputs.copy()
+        # Input -> Reservoir
+        input_activation = np.dot(inputs, self.input_weights)
+        
+        # Reservoir recurrent update (the magic happens here)
+        reservoir_input = input_activation + np.dot(self.reservoir_state, self.reservoir_weights)
+        
+        # Apply activation functions per neuron
+        new_state = np.zeros(self.reservoir_size)
+        for i in range(self.reservoir_size):
+            new_state[i] = ActivationFunctions.activate(
+                reservoir_input[i:i+1], 
+                self.reservoir_activations[i]
+            )[0]
+        
+        # Leak integration (combines old state with new)
+        self.reservoir_state = (1 - leak_rate) * self.reservoir_state + leak_rate * new_state
+        
+        # Reservoir -> Output
+        output_activation = np.dot(self.reservoir_state, self.output_weights) + self.output_bias
+        
+        # Apply output activations
+        outputs = np.zeros(self.output_size)
+        for i in range(self.output_size):
+            outputs[i] = ActivationFunctions.activate(
+                output_activation[i:i+1],
+                self.output_activations[i]
+            )[0]
+        
+        return outputs
+    
+    def reset_state(self):
+        """Reset reservoir state (call at start of episode)."""
+        self.reservoir_state = np.zeros(self.reservoir_size)
+    
+    def mutate(self, mutation_rate: float = 0.1, mutation_strength: float = 0.3,
+           structural_mutation_rate: float = 0.05, activation_mutation_rate: float = 0.05):
+        """
+        Mutate network weights, structure, and activation functions.
+        
+        Args:
+            mutation_rate: Probability of mutating each weight
+            mutation_strength: Standard deviation of weight mutations
+            structural_mutation_rate: Probability of structural changes
+            activation_mutation_rate: Probability of changing activation function
+        """
+        # === WEIGHT MUTATIONS ===
+        # Mutate input weights
+        mask = np.random.random(self.input_weights.shape) < mutation_rate
+        self.input_weights += mask * np.random.randn(*self.input_weights.shape) * mutation_strength
+        
+        # Mutate output weights
+        mask = np.random.random(self.output_weights.shape) < mutation_rate
+        self.output_weights += mask * np.random.randn(*self.output_weights.shape) * mutation_strength
+        
+        # Mutate output bias
+        mask = np.random.random(self.output_bias.shape) < mutation_rate
+        self.output_bias += mask * np.random.randn(*self.output_bias.shape) * mutation_strength
+        
+        # Mutate reservoir weights (careful - affects stability)
+        mask = np.random.random(self.reservoir_weights.shape) < mutation_rate * 0.3  # Lower rate
+        self.reservoir_weights += mask * np.random.randn(*self.reservoir_weights.shape) * mutation_strength * 0.5
+        
+        # Re-scale spectral radius after mutation
+        eigenvalues = np.linalg.eigvals(self.reservoir_weights)
+        max_eigenvalue = np.max(np.abs(eigenvalues))
+        if max_eigenvalue > 0:
+            self.reservoir_weights = self.reservoir_weights * (self.spectral_radius / max_eigenvalue)
+        
+        # === ACTIVATION FUNCTION MUTATIONS ===
+        for i in range(self.reservoir_size):
+            if random.random() < activation_mutation_rate:
+                self.reservoir_activations[i] = random.choice(list(ActivationType))
+        
+        for i in range(self.output_size):
+            if random.random() < activation_mutation_rate:
+                self.output_activations[i] = random.choice(list(ActivationType))
+        
+        # === STRUCTURAL MUTATIONS ===
+        if random.random() < structural_mutation_rate:
+            mutation_type = random.choice([
+                'add_reservoir_connection',
+                'remove_reservoir_connection',
+                'add_input_connection',      # NEW
+                'remove_input_connection',   # NEW
+                'add_output_connection',     # NEW
+                'remove_output_connection',  # NEW
+                'resize_reservoir',
+                'mutate_spectral_radius'
+            ])
+            
+            if mutation_type == 'add_reservoir_connection':
+                # Add new reservoir connection
+                i, j = random.randint(0, self.reservoir_size-1), random.randint(0, self.reservoir_size-1)
+                self.reservoir_weights[i, j] = np.random.randn() * 0.5
+                
+            elif mutation_type == 'remove_reservoir_connection':
+                # Remove reservoir connection
+                i, j = random.randint(0, self.reservoir_size-1), random.randint(0, self.reservoir_size-1)
+                self.reservoir_weights[i, j] = 0
+            
+            # NEW: Input-to-reservoir connection mutations
+            elif mutation_type == 'add_input_connection':
+                # Add new input-to-reservoir connection
+                # input_weights shape: (input_size, reservoir_size)
+                inp_idx = random.randint(0, self.input_size - 1)
+                res_idx = random.randint(0, self.reservoir_size - 1)
+                self.input_weights[inp_idx, res_idx] = np.random.randn() * 0.3
+                
+            elif mutation_type == 'remove_input_connection':
+                # Remove input-to-reservoir connection
+                inp_idx = random.randint(0, self.input_size - 1)
+                res_idx = random.randint(0, self.reservoir_size - 1)
+                self.input_weights[inp_idx, res_idx] = 0
+            
+            # NEW: Reservoir-to-output connection mutations
+            elif mutation_type == 'add_output_connection':
+                # Add new reservoir-to-output connection
+                # output_weights shape: (reservoir_size, output_size)
+                res_idx = random.randint(0, self.reservoir_size - 1)
+                out_idx = random.randint(0, self.output_size - 1)
+                self.output_weights[res_idx, out_idx] = np.random.randn() * 0.3
+                
+            elif mutation_type == 'remove_output_connection':
+                # Remove reservoir-to-output connection
+                res_idx = random.randint(0, self.reservoir_size - 1)
+                out_idx = random.randint(0, self.output_size - 1)
+                self.output_weights[res_idx, out_idx] = 0
+
+            elif mutation_type == 'mutate_spectral_radius':
+                # Adjust spectral radius by a small amount
+                old_radius = self.spectral_radius
+                
+                # Mutate: ±0.05 to ±0.15
+                delta = random.uniform(-0.15, 0.15)
+                new_radius = self.spectral_radius + delta
+                
+                # Clamp to reasonable range
+                # < 1.0 = stable/fading memory
+                # = 1.0 = edge of chaos (ideal for many tasks)
+                # > 1.0 = unstable/chaotic
+                self.spectral_radius = np.clip(new_radius, 0.5, 1.2)
+                
+                # Rescale reservoir weights to new spectral radius
+                eigenvalues = np.linalg.eigvals(self.reservoir_weights)
+                max_eigenvalue = np.max(np.abs(eigenvalues))
+                if max_eigenvalue > 0:
+                    self.reservoir_weights = self.reservoir_weights * (self.spectral_radius / max_eigenvalue)
+                
+            elif mutation_type == 'resize_reservoir':
+                # Change reservoir size slightly
+                size_change = random.choice([-2, -1, 1, 2])
+                new_size = max(10, min(200, self.reservoir_size + size_change))
+                if new_size != self.reservoir_size:
+                    self._resize_reservoir(new_size)
+    
+    def _resize_reservoir(self, new_size: int):
+        """Resize the reservoir (grow or shrink)."""
+        old_size = self.reservoir_size
+        
+        if new_size > old_size:
+            # Growing - add new neurons
+            diff = new_size - old_size
+            
+            # Expand input weights
+            new_input_weights = np.random.randn(self.input_size, diff) * 0.5
+            self.input_weights = np.hstack([self.input_weights, new_input_weights])
+            
+            # Expand reservoir weights
+            new_reservoir_weights = np.zeros((new_size, new_size))
+            new_reservoir_weights[:old_size, :old_size] = self.reservoir_weights
+            # Add new random connections
+            new_reservoir_weights[old_size:, :] = np.random.randn(diff, new_size) * 0.3
+            new_reservoir_weights[:, old_size:] = np.random.randn(new_size, diff) * 0.3
+            self.reservoir_weights = new_reservoir_weights
+            
+            # Expand output weights
+            new_output_weights = np.random.randn(diff, self.output_size) * 0.5
+            self.output_weights = np.vstack([self.output_weights, new_output_weights])
+            
+            # Add activation functions for new neurons
+            self.reservoir_activations.extend([
+                random.choice(list(ActivationType)) for _ in range(diff)
+            ])
+            
+            # Expand state
+            self.reservoir_state = np.zeros(new_size)
+            
+        else:
+            # Shrinking - remove neurons
+            # Keep the most connected neurons
+            connection_counts = np.sum(np.abs(self.reservoir_weights), axis=1)
+            keep_indices = np.argsort(connection_counts)[-new_size:]
+            
+            self.input_weights = self.input_weights[:, keep_indices]
+            self.reservoir_weights = self.reservoir_weights[keep_indices][:, keep_indices]
+            self.output_weights = self.output_weights[keep_indices, :]
+            self.reservoir_activations = [self.reservoir_activations[i] for i in keep_indices]
+            self.reservoir_state = np.zeros(new_size)
+        
+        self.reservoir_size = new_size
+    
+    def clone(self) -> 'RecurrentNeuralNetwork':
+        """Create a deep copy of this network."""
+        cloned = RecurrentNeuralNetwork(
+            self.input_size, 
+            self.reservoir_size, 
+            self.output_size,
+            self.spectral_radius,
+            self.sparsity
+        )
+        
+        cloned.input_weights = self.input_weights.copy()
+        cloned.reservoir_weights = self.reservoir_weights.copy()
+        cloned.output_weights = self.output_weights.copy()
+        cloned.output_bias = self.output_bias.copy()
+        cloned.reservoir_activations = self.reservoir_activations.copy()
+        cloned.output_activations = self.output_activations.copy()
+        cloned.reservoir_state = self.reservoir_state.copy()
+        
+        return cloned
+    
+    def crossover(self, other: 'RecurrentNeuralNetwork', crossover_rate: float = 0.5) -> 'RecurrentNeuralNetwork':
+        """
+        Create offspring by crossing over with another network.
+        """
+        # Use the larger reservoir size
+        if self.reservoir_size >= other.reservoir_size:
+            offspring = self.clone()
+            other_parent = other
+        else:
+            offspring = other.clone()
+            other_parent = self
+        
+        # Crossover output weights
+        if offspring.output_weights.shape == other_parent.output_weights.shape:
+            mask = np.random.random(offspring.output_weights.shape) < crossover_rate
+            offspring.output_weights = np.where(mask, offspring.output_weights, other_parent.output_weights)
+            
+            mask = np.random.random(offspring.output_bias.shape) < crossover_rate
+            offspring.output_bias = np.where(mask, offspring.output_bias, other_parent.output_bias)
+        
+        # Crossover activation functions
+        for i in range(min(len(offspring.reservoir_activations), len(other_parent.reservoir_activations))):
+            if random.random() < crossover_rate:
+                offspring.reservoir_activations[i] = other_parent.reservoir_activations[i]
+        
+        return offspring
+    
+    def get_complexity(self) -> int:
+        """Get network complexity (total parameters)."""
+        return (self.input_weights.size + 
+                self.reservoir_weights.size + 
+                self.output_weights.size + 
+                self.output_bias.size)
+    
+    def get_architecture_string(self) -> str:
+        """Get a string describing the network architecture."""
+        # Count non-zero connections
+        input_connections = np.count_nonzero(self.input_weights)
+        reservoir_connections = np.count_nonzero(self.reservoir_weights)
+        output_connections = np.count_nonzero(self.output_weights)
+        
+        return (f"RNN[{self.input_size}→{self.reservoir_size}→{self.output_size}] "
+                f"SR:{self.spectral_radius:.2f} "  # NEW: Show spectral radius
+                f"C:{input_connections}+{reservoir_connections}+{output_connections}")
 
 class NeuralNetwork:
     """Feedforward neural network with variable architecture."""
@@ -385,7 +773,6 @@ class Water:
 # ============================================================================
 # GARDEN CLASS (NEW)
 # ============================================================================
-
 @dataclass
 class Garden:
     """Garden plot that agents can create and plant food in."""
@@ -404,8 +791,9 @@ class Garden:
     color: Tuple[int, int, int] = (139, 69, 19)  # Brown
     harvested: bool = False
 
-    times_harvested: int = 0  # NEW: Track harvest count
-    max_harvests: int = 20  # NEW: Max times before removal
+    times_harvested: int = 0  # Track harvest count
+    last_interaction_timestep: int = 0  # NEW: When was it last interacted with
+    inactivity_threshold: int = 10000  # NEW: Remove after 10k timesteps of no interaction
     
     def distance_to_point(self, x: float, y: float) -> float:
         """Calculate distance to a point."""
@@ -420,6 +808,8 @@ class Garden:
     
     def update(self):
         """Update garden growth."""
+        self.inactivity_threshold -= 1
+        
         if self.planted and self.watered and not self.harvested:
             self.growth_timer += 1
 
@@ -431,13 +821,29 @@ class Garden:
                 self.reset()
     
     def reset(self):
-        """NEW: Reset garden to be usable again."""
+        """Reset garden to be usable again."""
         self.planted = False
         self.watered = False
         self.growth_timer = 0
         self.harvested = False
         self.cooldown_timer = 0
         print(f"  ♻️  Garden at ({self.x:.0f}, {self.y:.0f}) is ready to use again!")
+
+    def mark_interaction(self, current_timestep: int):
+        """NEW: Mark that this garden was interacted with."""
+        self.inactivity_threshold = 10000
+    
+    def plant(self, current_timestep: int):
+        """NEW: Plant the garden and mark interaction."""
+        if self.is_available():
+            self.planted = True
+            self.mark_interaction(current_timestep)
+    
+    def water(self, current_timestep: int):
+        """NEW: Water the garden and mark interaction."""
+        if self.planted and not self.watered:
+            self.watered = True
+            self.mark_interaction(current_timestep)
 
     def is_ready_to_harvest(self) -> bool:
         """Check if garden is ready to harvest."""
@@ -452,50 +858,66 @@ class Garden:
         return min(1.0, self.growth_timer / self.growth_time)
     
     def is_available(self) -> bool:
-        """NEW: Check if garden is available for planting."""
+        """Check if garden is available for planting."""
         return not self.planted and not self.harvested
     
     def is_on_cooldown(self) -> bool:
-        """NEW: Check if garden is on cooldown."""
+        """Check if garden is on cooldown."""
         return self.harvested and self.cooldown_timer < self.cooldown_time
     
     def get_cooldown_percentage(self) -> float:
-        """NEW: Get cooldown percentage (0-1)."""
+        """Get cooldown percentage (0-1)."""
         if not self.is_on_cooldown():
             return 1.0
         return self.cooldown_timer / self.cooldown_time
     
-    def harvest(self) -> bool:
+    def harvest(self, current_timestep: int) -> int:
         """
-        NEW: Mark garden as harvested and increment counter.
-        Returns True if garden should be removed (reached max harvests).
+        Mark garden as harvested and return food yield.
+        
+        Args:
+            current_timestep: Current simulation timestep
+            
+        Returns:
+            Amount of food produced
         """
         if not self.is_ready_to_harvest():
-            return False
+            return 0
         
         self.harvested = True
         self.times_harvested += 1
+        self.mark_interaction(current_timestep)
         
-        # Check if garden has reached its harvest limit
-        return self.times_harvested >= self.max_harvests
+        return self.food_multiplier
     
-    def should_be_removed(self) -> bool:
-        """NEW: Check if garden should be removed."""
-        return self.times_harvested >= self.max_harvests
+    def should_be_removed(self, current_timestep: int) -> bool:
+        """
+        NEW: Check if garden should be removed due to inactivity.
+        
+        Args:
+            current_timestep: Current simulation timestep
+            
+        Returns:
+            True if garden has been inactive for too long
+        """
+        #timesteps_since_interaction = current_timestep - self.last_interaction_timestep
+        #if self.inactivity_threshold < 0:
+            #print(f"  💀  Removed garden at ({self.x:.0f}, {self.y:.0f}) due to inactivity")
+        return self.inactivity_threshold < 0
     
     def get_color(self) -> Tuple[int, int, int]:
         """Get color based on garden state."""
         if self.is_on_cooldown():
             # Fade from gray to brown during cooldown
             progress = self.get_cooldown_percentage()
-            gray = 100
+            gray = 120
             target_r, target_g, target_b = 139, 69, 19
             r = int(gray + (target_r - gray) * progress)
             g = int(gray + (target_g - gray) * progress)
             b = int(gray + (target_b - gray) * progress)
             return (r, g, b)
         elif self.harvested:
-            return (100, 100, 100)  # Gray - shouldn't happen with cooldown
+            return (120, 120, 120)  # Gray - on cooldown
         elif self.is_ready_to_harvest():
             return (0, 200, 0)  # Bright green - ready
         elif self.planted and self.watered:
@@ -509,33 +931,19 @@ class Garden:
             return (160, 82, 45)  # Light brown - needs water
         else:
             return (139, 69, 19)  # Brown - empty plot
-        
-
 
 # ============================================================================
 # AI AGENT
 # ============================================================================
 
 class Agent:
-    """AI agent that controls a circle."""
-    
     def __init__(self, agent_id: int, x: float, y: float, radius: float = 10.0,
-                 input_size: int = input_size, hidden_layers: Optional[List[int]] = None,  # CHANGED from 20 to 22
-                 output_size: int = output_size, brain: Optional[NeuralNetwork] = None,
+                 input_size: int = input_size,
+                 hidden_layers: Optional[List[int]] = None,  # Keep for compatibility
+                 output_size: int = output_size, 
+                 brain: Optional[RecurrentNeuralNetwork] = None,  # Changed type hint
                  generation_born: int = 1):
-        """
-        Initialize an AI agent.
-        
-        Args:
-            agent_id: Unique identifier
-            x, y: Starting position
-            radius: Circle radius
-            input_size: Number of sensor inputs (22 for food + water + health sensing)
-            hidden_layers: Hidden layer architecture (None = simple default)
-            output_size: Number of action outputs
-            brain: Optional pre-existing brain (for evolution)
-            generation_born: Generation this agent was born in
-        """
+        """Initialize an AI agent with recurrent brain."""
         self.id = agent_id
         self.generation_born = generation_born
         self.circle = Circle(
@@ -545,13 +953,23 @@ class Agent:
             color=self._random_color()
         )
         
-        # Default to simple architecture if none provided
-        if hidden_layers is None and brain is None:
-            hidden_layers = [12]  # Start with simple 22-12-4 network
+        # Create recurrent brain if not provided
+        if brain is None:
+            # Default reservoir size - can be evolved
+            reservoir_size = 50  # Good starting point
+            self.brain = RecurrentNeuralNetwork(
+                input_size=input_size,
+                reservoir_size=reservoir_size,
+                output_size=output_size,
+                spectral_radius=0.9,  # Stable dynamics
+                sparsity=0.1  # 10% connections
+            )
+        else:
+            self.brain = brain
         
-        self.brain = brain if brain else NeuralNetwork(input_size, hidden_layers, output_size)
         self.fitness = 0.0
         self.alive = True
+        
         
         # Resource stats
         self.food = 100.0  # Renamed from energy
@@ -597,6 +1015,15 @@ class Agent:
                 random.randint(50, 255), 
                 random.randint(50, 255))
     
+    def generate_name(self):
+        first_name_1 = ['Kim', 'Yorg', 'Bing', 'Bop', 'Bong', 'Tod', 'Shwing', 'Ging', 'Biff', 'Bip', 'Won', 'Boo', 'Pow', 'Baff', 'Flip', 'Shoop']
+        first_name_2 = ['yorg', 'bing', 'ing', 'bop', 'bong', 'tod', 'shwing', 'ging', 'biff', 'bip', 'won', 'boo', 'pow', 'baff', ' Von', ' The', 'hep', 'grep', 'fed', 'san', 'gorp', 'shoop']
+        
+    def reset_brain_state(self):
+        """Reset the recurrent network's internal state."""
+        if hasattr(self.brain, 'reset_state'):
+            self.brain.reset_state()
+    
     def sense(self, environment: 'Environment') -> np.ndarray:
         """
         Gather sensory information from the environment (ANGLE-BASED).
@@ -605,11 +1032,11 @@ class Agent:
         0: Angle to nearest food (normalized -1 to 1)
         1: Angle to second nearest food (normalized -1 to 1)
         2: Angle to nearest water (normalized -1 to 1)
-        3: Angle to second nearest water (normalized -1 to 1)
+        3: Distance to nearest water (0 to 1)
         4: Angle to nearest agent (normalized -1 to 1)
         5: Angle to second nearest agent (normalized -1 to 1)
-        6: Own velocity X (normalized)
-        7: Own velocity Y (normalized)
+        6: Distance to nearest wall (normalized 0-1, closer = lower value)
+        7: Health level (normalized 0-1)
         8: Food level (normalized 0-1)
         9: Water level (normalized 0-1)
         10: Food inventory (normalized 0-1)
@@ -647,7 +1074,7 @@ class Agent:
             sensors[0] = 0.0
             sensors[1] = 0.0
         
-        # === WATER SENSING (2 nearest) ===
+        # === WATER SENSING (angle + distance to nearest) ===
         water_list = [w for w in environment.water if not w.depleted]
         if water_list:
             water_distances = [(w, self.circle.distance_to_point(w.x, w.y)) for w in water_list]
@@ -655,42 +1082,68 @@ class Agent:
             
             # Nearest water
             nearest_water = water_distances[0][0]
+            nearest_water_distance = water_distances[0][1]
+            
+            # Angle to nearest water
             sensors[2] = self._angle_to_target(nearest_water.x, nearest_water.y)
             
-            # Second nearest water
-            if len(water_distances) > 1:
-                second_water = water_distances[1][0]
-                sensors[3] = self._angle_to_target(second_water.x, second_water.y)
-            else:
-                sensors[3] = 0.0
+            # Distance to nearest water (normalized, inverted so closer = higher value)
+            # Use a max distance for normalization (e.g., 1000 pixels)
+            max_sense_distance = 1000.0
+            normalized_distance = min(nearest_water_distance / max_sense_distance, 1.0)
+            sensors[3] = 1.0 - normalized_distance  # Invert: closer = higher value
         else:
             sensors[2] = 0.0
-            sensors[3] = 0.0
+            sensors[3] = 0.0  # No water available
         
-        # === AGENT SENSING (2 nearest) ===
+        # === AGENT SENSING (2 nearest within 300px range) ===
+        agent_detection_range = 300.0  # Only detect agents within this range
+        
         other_agents = [a for a in environment.agents if a.id != self.id and a.alive]
         if other_agents:
+            # Filter to only nearby agents
             agent_distances = [(a, self.circle.distance_to(a.circle)) for a in other_agents]
-            agent_distances.sort(key=lambda x: x[1])
+            nearby_agents = [(a, dist) for a, dist in agent_distances if dist <= agent_detection_range]
+            nearby_agents.sort(key=lambda x: x[1])
             
-            # Nearest agent
-            nearest_agent = agent_distances[0][0]
-            sensors[4] = self._angle_to_target(nearest_agent.circle.x, nearest_agent.circle.y)
-            
-            # Second nearest agent
-            if len(agent_distances) > 1:
-                second_agent = agent_distances[1][0]
-                sensors[5] = self._angle_to_target(second_agent.circle.x, second_agent.circle.y)
+            if nearby_agents:
+                # Nearest nearby agent
+                nearest_agent = nearby_agents[0][0]
+                sensors[4] = self._angle_to_target(nearest_agent.circle.x, nearest_agent.circle.y)
+                
+                # Second nearest nearby agent
+                if len(nearby_agents) > 1:
+                    second_agent = nearby_agents[1][0]
+                    sensors[5] = self._angle_to_target(second_agent.circle.x, second_agent.circle.y)
+                else:
+                    sensors[5] = 0.0
             else:
+                # No agents within detection range
+                sensors[4] = 0.0
                 sensors[5] = 0.0
         else:
             sensors[4] = 0.0
             sensors[5] = 0.0
         
         # === SELF SENSING ===
-        max_velocity = 10.0
-        sensors[6] = np.clip(self.circle.velocity_x / max_velocity, -1, 1)
-        sensors[7] = np.clip(self.circle.velocity_y / max_velocity, -1, 1)
+        # Distance to nearest wall (NEW)
+        dist_to_left = self.circle.x
+        dist_to_right = environment.width - self.circle.x
+        dist_to_top = self.circle.y
+        dist_to_bottom = environment.height - self.circle.y
+        
+        nearest_wall_distance = min(dist_to_left, dist_to_right, dist_to_top, dist_to_bottom)
+        
+        # Normalize: use a reference distance (e.g., 500 pixels)
+        # Closer to wall = lower value, far from wall = higher value
+        max_wall_distance = 500.0
+        sensors[6] = 1 - np.clip(nearest_wall_distance / max_wall_distance, 0, 1)
+        if sensors[6] > 0.95:
+            sensors[6] += random.uniform(-2, 2)
+        
+        # Health level (normalized)
+        sensors[7] = self.health / self.max_health
+        
         sensors[8] = self.food / self.max_food
         sensors[9] = self.water / self.max_water
         sensors[10] = self.food_inventory / self.max_inventory
@@ -811,28 +1264,28 @@ class Agent:
         print(f"  🌱 Agent {self.id} created garden at ({garden_x:.0f}, {garden_y:.0f})")
     
     def try_plant_garden(self, environment: 'Environment'):
-        """NEW: Try to plant food in a nearby garden."""
+        """Try to plant food in a nearby garden."""
         if self.food_inventory < 1:
             return
         
         # Find nearest empty garden
         for garden in environment.gardens:
-            if garden.planted or garden.harvested:
+            if not garden.is_available():  # Use the new method
                 continue
             
             if garden.is_touching_circle(self.circle):
                 # Plant food
                 self.food_inventory -= 1
-                garden.planted = True
+                garden.plant(environment.timestep)  # UPDATED: Use new method with timestep
                 
                 self.gardens_planted += 1
                 self.fitness += 15
                 
                 print(f"  🌾 Agent {self.id} planted in garden at ({garden.x:.0f}, {garden.y:.0f})")
                 return
-    
+
     def try_water_garden(self, environment: 'Environment'):
-        """NEW: Try to water a planted garden."""
+        """Try to water a planted garden."""
         if self.water < 30:
             return
         
@@ -844,42 +1297,39 @@ class Agent:
             if garden.is_touching_circle(self.circle):
                 # Water garden
                 self.water -= 30
-                garden.watered = True
+                garden.water(environment.timestep)  # UPDATED: Use new method with timestep
                 
                 self.gardens_watered += 1
                 self.fitness += 25
                 
                 print(f"  💧 Agent {self.id} watered garden at ({garden.x:.0f}, {garden.y:.0f})")
                 return
-    
+
     def try_harvest_garden(self, environment: 'Environment'):
-        """UPDATED: Try to harvest a ready garden and remove if at limit."""
-        for garden in environment.gardens[:]:  # Use slice to allow removal during iteration
+        """Try to harvest a ready garden."""
+        for garden in environment.gardens:
             if not garden.is_ready_to_harvest():
                 continue
             
             if garden.is_touching_circle(self.circle):
-                # Harvest food
-                food_gained = garden.food_multiplier
+                # Harvest food (returns amount of food produced)
+                food_gained = garden.harvest(environment.timestep)  # UPDATED: Pass timestep, returns food amount
                 
+                if food_gained == 0:  # Safety check
+                    continue
+                
+                # Add harvested food to inventory or directly to food level
                 for _ in range(food_gained):
                     if self.food_inventory < self.max_inventory:
                         self.food_inventory += 1
                     else:
                         self.food = min(self.food + 10, self.max_food)
                 
-                # Mark as harvested and check if should be removed
-                should_remove = garden.harvest()
-                
                 self.gardens_harvested += 1
                 self.food_collected += food_gained
                 self.fitness += 50
                 
-                if should_remove:
-                    environment.gardens.remove(garden)
-                    print(f"  🗑️  Garden at ({garden.x:.0f}, {garden.y:.0f}) removed after {garden.max_harvests} harvests!")
-                else:
-                    print(f"  🎉 Agent {self.id} harvested {food_gained} food from garden at ({garden.x:.0f}, {garden.y:.0f}) - {garden.times_harvested}/{garden.max_harvests} total")
+                print(f"  🎉 Agent {self.id} harvested {food_gained} food from garden at ({garden.x:.0f}, {garden.y:.0f}) - Total harvests: {garden.times_harvested}")
                 
                 return
     
@@ -911,6 +1361,7 @@ class Agent:
         # Check if agent died
         if self.health <= 0:
             self.alive = False
+            self.reset_brain_state()
     
     def update_resources(self, dt: float):
         """Update food and water levels (both decrease over time)."""
@@ -1001,8 +1452,11 @@ class Agent:
         child_brain.mutate(
             mutation_rate=0.1, 
             mutation_strength=0.2,
-            structural_mutation_rate=0.05
+            structural_mutation_rate=0.05,
+            activation_mutation_rate=0.05
         )
+
+        child_brain.reset_state()
         
         # Create child agent with correct input size
         child = Agent(
@@ -1110,6 +1564,11 @@ class Environment:
         # UI state for scrolling
         self.scroll_offset = 0
         self.panel_width = 320
+
+        # Selected agent for brain visualization
+        self.selected_agent: Optional[Agent] = None
+        self.show_brain_viz = False
+        self.brain_viz_close_rect = None
         
         # Food spawning parameters
         self.food_spawn_interval = 30
@@ -1122,7 +1581,7 @@ class Environment:
         self.water_per_spawn = 1  # Spawn one at a time
         
         # Population parameters
-        self.max_population = 50
+        self.max_population = 1000
         self.min_population = 10
         
         # Evolution parameters
@@ -1230,38 +1689,39 @@ class Environment:
         """Add a new agent to the environment (used for births)."""
         self.agents.append(agent)
 
-    def update_hall_of_fame(self, print_stats = False):
+    def update_hall_of_fame(self, print_stats=False):
         """
         Update the hall of fame with best performers from current generation.
-        NOW PREVENTS DUPLICATE AGENTS - each agent ID can only appear once.
+        PREVENTS DUPLICATE AGENTS - each agent ID can only appear once.
+        PRESERVES loaded Hall of Fame entries.
         """
         # Get all agents with positive fitness
         candidates = [a for a in self.agents if a.fitness > 0]
         
-        if not candidates:
-            return
-        
-        # Sort by fitness
-        candidates.sort(key=lambda a: a.fitness, reverse=True)
-        
-        # Get set of agent IDs already in hall of fame
-        existing_agent_ids = set(record.get('agent_id') for record in self.hall_of_fame if 'agent_id' in record)
-
+        # Build existing Hall of Fame lookup dictionary
         hof_by_agent_id = {}
         hof_without_id = []  # Old entries without agent_id
         
         for record in self.hall_of_fame:
-            if 'agent_id' in record:
+            if 'agent_id' in record and record['agent_id'] is not None:
                 hof_by_agent_id[record['agent_id']] = record
             else:
+                # Keep old entries without IDs - they're from loaded saves
                 hof_without_id.append(record)
         
-        # Add top performers to hall of fame (only if not already present)
+        # If no good candidates this generation, keep existing Hall of Fame unchanged
+        if not candidates:
+            if print_stats:
+                print("  ℹ️  No agents with positive fitness this generation - Hall of Fame unchanged")
+            return
+        
+        # Sort candidates by fitness
+        candidates.sort(key=lambda a: a.fitness, reverse=True)
+        
+        # Add top performers to hall of fame (only if not already present or if fitness improved)
         for agent in candidates[:5]:  # Consider top 5 from this generation
-            
-            
             agent_record = {
-                'agent_id': agent.id,  # NEW: Track agent ID to prevent duplicates
+                'agent_id': agent.id,  # Track agent ID to prevent duplicates
                 'brain': agent.brain.clone(),
                 'fitness': agent.fitness,
                 'generation': self.generation,
@@ -1274,11 +1734,13 @@ class Environment:
             }
             
             if agent.id in hof_by_agent_id:
-                # Agent already in hall of fame - UPDATE their entry
+                # Agent already in hall of fame - UPDATE their entry if fitness improved
                 old_fitness = hof_by_agent_id[agent.id]['fitness']
-                hof_by_agent_id[agent.id] = agent_record
-                if print_stats:
-                    print(f"  🔄 Updated Agent {agent.id} in HOF: {old_fitness:.2f} → {agent.fitness:.2f}")
+                if agent.fitness > old_fitness:
+                    hof_by_agent_id[agent.id] = agent_record
+                    if print_stats:
+                        print(f"  🔄 Updated Agent {agent.id} in HOF: {old_fitness:.2f} → {agent.fitness:.2f}")
+                # else: keep old record with better fitness
             else:
                 # New agent - ADD to hall of fame
                 hof_by_agent_id[agent.id] = agent_record
@@ -1286,6 +1748,7 @@ class Environment:
                     print(f"  ✨ Added Agent {agent.id} to HOF: {agent.fitness:.2f}")
         
         # Rebuild hall of fame list from dictionary + old entries
+        # IMPORTANT: Preserve old entries without IDs (from loaded saves)
         self.hall_of_fame = list(hof_by_agent_id.values()) + hof_without_id
         
         # Sort hall of fame by fitness
@@ -1302,7 +1765,7 @@ class Environment:
                 print(f"   Best Ever: {self.best_fitness_ever:.2f} (Gen {self.hall_of_fame[0]['generation']})")
                 print(f"   Full HOF:")
                 for i, record in enumerate(self.hall_of_fame):
-                    agent_id_str = f"Agent {record['agent_id']}" if 'agent_id' in record else "Unknown"
+                    agent_id_str = f"Agent {record['agent_id']}" if 'agent_id' in record and record['agent_id'] is not None else "Legacy"
                     print(f"     {i+1}. {agent_id_str} | Fitness {record['fitness']:.2f} | "
                         f"Gen {record['generation']} | "
                         f"Arch: {record['architecture']} | "
@@ -1366,29 +1829,31 @@ class Environment:
         self._spawn_random_agents(num_random)
 
     def _spawn_random_agents(self, num_agents: int):
-        """Spawn completely random agents."""
+        """Spawn completely random agents with recurrent brains."""
         for i in range(num_agents):
             x = random.uniform(50, self.width - 50)
             y = random.uniform(50, self.height - 50)
             
-            # Random simple architecture
-            hidden_layers = random.choice([
-                [10, 8, 6],           # 3 layers
-                [12, 10, 8],          # 3 layers
-                [14, 12, 10],         # 3 layers
-                [12, 10, 8, 6],       # 4 layers
-                [14, 12, 10, 8],      # 4 layers
-                [16, 14, 12, 10],     # 4 layers
-                [14, 12, 10, 8, 6],   # 5 layers
-                [16, 14, 12, 10, 8],  # 5 layers
-            ])
+            # Random reservoir sizes
+            reservoir_size = random.choice([30, 40, 50, 60, 70, 80])
+            spectral_radius = random.uniform(0.85, 0.95)
+            sparsity = random.uniform(0.05, 0.15)
+            
+            # Create recurrent brain
+            brain = RecurrentNeuralNetwork(
+                input_size=input_size,
+                reservoir_size=reservoir_size,
+                output_size=output_size,
+                spectral_radius=spectral_radius,
+                sparsity=sparsity
+            )
             
             agent = Agent(
                 agent_id=self.next_agent_id,
                 x=x,
                 y=y,
                 input_size=input_size,
-                hidden_layers=hidden_layers,
+                brain=brain,
                 generation_born=self.generation + 1
             )
             self.agents.append(agent)
@@ -1444,12 +1909,27 @@ class Environment:
         for garden in self.gardens:
             garden.update()
         
+        # NEW: Remove inactive gardens periodically
+        if self.timestep % 100 == 0:
+            initial_garden_count = len(self.gardens)
+            self.gardens = [g for g in self.gardens if not g.should_be_removed(self.timestep)]
+            removed = initial_garden_count - len(self.gardens)
+            if removed > 0:
+                print(f"  🗑️  Removed {removed} inactive garden(s)")
+
         # Handle interactions
         self.handle_food_collection()
         self.handle_water_collection()
         self.handle_reproduction()
         self.handle_collisions()
         self.handle_interactions()
+
+        # NEW: Check if selected agent is still valid
+        if self.selected_agent is not None:
+            if not self.selected_agent.alive or self.selected_agent not in self.agents:
+                print(f"⚠️  Selected agent {self.selected_agent.id} is no longer valid - clearing selection")
+                self.selected_agent = None
+                self.show_brain_viz = False
         
         # Clean up consumed resources periodically
         if self.timestep % 100 == 0:
@@ -1581,17 +2061,6 @@ class Environment:
         
         if removed > 0:
             print(f"  💀 Removed {removed} dead agent(s). Population: {len(self.agents)}")
-    
-    def should_evolve(self) -> bool:
-        """Determine if population should evolve."""
-        alive_count = sum(1 for a in self.agents if a.alive)
-        
-        if alive_count < self.min_population:
-            return True
-        
-        generation_time_reached = (self.timestep % self.generation_length == 0) and self.timestep > 0
-        
-        return generation_time_reached
     
     def get_nearby_agents(self, agent: Agent, radius: float) -> List[Agent]:
         """Get agents within a certain radius."""
@@ -1766,7 +2235,7 @@ class Environment:
                         
                         # Mutation
                         child_brain.mutate(
-                            mutation_rate=0.12, 
+                            mutation_rate=0.05, 
                             mutation_strength=0.25,
                             structural_mutation_rate=0.1
                         )
@@ -1856,7 +2325,7 @@ class Environment:
             # Mutate some of them for variation
             if random.random() < mutation_chance:
                 brain.mutate(
-                    mutation_rate=0.08,  # Light mutation
+                    mutation_rate=0.05,  # Light mutation
                     mutation_strength=0.15,
                     structural_mutation_rate=0.02  # Rare structural changes
                 )
@@ -1905,7 +2374,7 @@ class Environment:
             
             # Apply STRUCTURAL mutations (encourage architecture evolution)
             brain.mutate(
-                mutation_rate=0.15,  # Weight mutations
+                mutation_rate=0.05,  # Weight mutations
                 mutation_strength=0.3,
                 structural_mutation_rate=structural_mutation_rate  # HIGH structural mutation
             )
@@ -1934,10 +2403,10 @@ class Environment:
         Returns:
             True if evolution should occur
         """
-        # Evolve when generation time is reached or all agents are dead
+        # Evolve when generation time is reached (and < 10 agents) or all agents are dead
         alive_count = sum(1 for a in self.agents if a.alive)
         
-        generation_time_reached = (self.timestep % self.generation_length == 0) and self.timestep > 0
+        generation_time_reached = self.timestep > self.generation_length and self.timestep > 0 and alive_count < self.min_population
         all_dead = alive_count == 0
         
         return generation_time_reached or all_dead
@@ -1957,6 +2426,544 @@ class Environment:
         """
         tournament = random.sample(population, min(tournament_size, len(population)))
         return max(tournament, key=lambda a: a.fitness)
+    
+    def handle_agent_list_click(self, mouse_x: int, mouse_y: int, viewport_width: int, viewport_height: int):
+        """
+        Handle clicks on the agent list panel.
+        
+        Args:
+            mouse_x, mouse_y: Mouse position
+            viewport_width, viewport_height: Size of viewport
+        """
+        panel_x = viewport_width
+        header_height = 50
+        scroll_area_y = header_height
+        
+        # Check if click is within the panel
+        if mouse_x < panel_x or mouse_x > panel_x + self.panel_width:
+            return
+        
+        if mouse_y < scroll_area_y or mouse_y > viewport_height:
+            return
+        
+        # Calculate which agent was clicked
+        item_height = 115
+        click_y = mouse_y - scroll_area_y + self.scroll_offset
+        clicked_index = int(click_y / item_height)
+        
+        # Get sorted agents (same order as display)
+        alive_agents = [a for a in self.agents if a.alive]
+        sorted_agents = sorted(alive_agents, key=lambda a: a.age, reverse=True)
+        
+        if 0 <= clicked_index < len(sorted_agents):
+            clicked_agent = sorted_agents[clicked_index]
+            
+            # Verify agent is still alive
+            if not clicked_agent.alive:
+                print(f"⚠️  Agent {clicked_agent.id} is no longer alive")
+                return
+            
+            self.selected_agent = clicked_agent
+            self.show_brain_viz = True
+            
+            # Move camera to selected agent
+            if self.camera:
+                self.camera.x = self.selected_agent.circle.x
+                self.camera.y = self.selected_agent.circle.y
+            
+            print(f"📍 Selected Agent {self.selected_agent.id}")
+            print(f"   Brain type: {type(self.selected_agent.brain).__name__}")
+            print(f"   Architecture: {self.selected_agent.brain.get_architecture_string()}")
+            print(f"   show_brain_viz = {self.show_brain_viz}")
+
+    def render_brain_visualization(self, screen, viewport_width: int, viewport_height: int):
+        """
+        Render a visual representation of the selected agent's brain.
+        Shows nodes colored by their activation values.
+        """
+        # Validate selected agent
+        if self.selected_agent is None:
+            print("⚠️  No agent selected")
+            self.show_brain_viz = False
+            return None
+        
+        if not self.show_brain_viz:
+            return None
+        
+        # Check if agent is still alive
+        if not self.selected_agent.alive:
+            print(f"⚠️  Selected agent {self.selected_agent.id} died")
+            self.selected_agent = None
+            self.show_brain_viz = False
+            return None
+        
+        # Verify agent is still in the agents list
+        if self.selected_agent not in self.agents:
+            print(f"⚠️  Selected agent {self.selected_agent.id} no longer in environment")
+            self.selected_agent = None
+            self.show_brain_viz = False
+            return None
+        
+        #import pygame
+        
+        agent = self.selected_agent
+        brain = agent.brain
+        
+        #print(f"🧠 Rendering brain for Agent {agent.id}")  # Debug
+        
+        # Brain viz panel dimensions - MOVED TO LEFT SIDE
+        panel_width = 450
+        panel_height = 550
+        panel_x = 20  # Left side with small margin
+        panel_y = 20  # Top with small margin
+        
+        # Create semi-transparent background
+        brain_surface = pygame.Surface((panel_width, panel_height))
+        brain_surface.set_alpha(240)
+        brain_surface.fill((30, 30, 40))
+        screen.blit(brain_surface, (panel_x, panel_y))
+        
+        # Draw border
+        pygame.draw.rect(screen, (100, 150, 200), (panel_x, panel_y, panel_width, panel_height), 3)
+        
+        # Header
+        font = pygame.font.Font(None, 24)
+        tiny_font = pygame.font.Font(None, 16)
+        
+        header_text = font.render(f"Agent {agent.id} Brain", True, (255, 255, 255))
+        screen.blit(header_text, (panel_x + 10, panel_y + 10))
+        
+        # Close button
+        close_text = font.render("X", True, (255, 100, 100))
+        close_rect = pygame.Rect(panel_x + panel_width - 35, panel_y + 5, 30, 30)
+        pygame.draw.rect(screen, (60, 30, 30), close_rect)
+        screen.blit(close_text, (panel_x + panel_width - 28, panel_y + 8))
+        
+        # Architecture info
+        arch_text = tiny_font.render(f"Architecture: {brain.get_architecture_string()}", True, (200, 200, 200))
+        screen.blit(arch_text, (panel_x + 10, panel_y + 35))
+        
+        # Check if recurrent or feedforward
+        is_recurrent = isinstance(brain, RecurrentNeuralNetwork)
+        
+        #print(f"   Is recurrent: {is_recurrent}")  # Debug
+        
+        if is_recurrent:
+            # Render recurrent network visualization
+            self._render_recurrent_brain(screen, brain, panel_x, panel_y, panel_width, panel_height, tiny_font)
+        else:
+            # Render feedforward network visualization
+            self._render_feedforward_brain(screen, brain, panel_x, panel_y, panel_width, panel_height, tiny_font)
+        
+        return close_rect  # Return for click detection
+
+    def _render_recurrent_brain(self, screen, brain: RecurrentNeuralNetwork, 
+                            panel_x: int, panel_y: int, panel_width: int, panel_height: int, font):
+        """Render recurrent neural network with reservoir visualization."""
+        import pygame
+        
+        # Layout: Input nodes | Reservoir nodes | Output nodes
+        node_radius = 6
+        margin = 60
+        content_y = panel_y + 60
+        content_height = panel_height - 80
+        
+        # Calculate positions
+        input_x = panel_x + margin
+        reservoir_x = panel_x + panel_width // 2
+        output_x = panel_x + panel_width - margin
+        
+        # Get current activations
+        reservoir_state = brain.reservoir_state
+        input_size = brain.input_size
+        output_size = brain.output_size
+        reservoir_size = brain.reservoir_size
+        
+        # Get current input values (stored during last forward pass)
+        if hasattr(brain, 'last_input') and brain.last_input is not None:
+            input_values = brain.last_input
+        else:
+            input_values = np.zeros(input_size)
+        
+        # Input node labels - MATCHED TO YOUR ACTUAL INPUTS
+        input_labels = [
+            "∠Food 1",      # 0: Angle to nearest food
+            "∠Food 2",      # 1: Angle to second nearest food
+            "∠Water",       # 2: Angle to nearest water
+            "Water Dist",   # 3: Distance to nearest water
+            "∠Agent 1",     # 4: Angle to nearest agent
+            "∠Agent 2",     # 5: Angle to second nearest agent
+            "Wall Dist",        # 6: distance to nearest wall
+            "Health",       # 7: Health level (CHANGED)
+            "Food Lvl",     # 8: Food level
+            "Water Lvl",    # 9: Water level
+            "Inventory",    # 10: Food inventory
+            "∠Garden",      # 11: Angle to nearest garden
+            "Garden St",    # 12: Nearest garden state
+            "Bias",         # 13: Bias input
+        ]
+        
+        # Ensure we have enough labels
+        while len(input_labels) < input_size:
+            input_labels.append(f"Input {len(input_labels)}")
+        
+        # Draw Input Nodes (vertically spaced)
+        input_spacing = min(content_height / (input_size + 1), 30)
+        input_start_y = content_y + (content_height - input_spacing * input_size) // 2
+        
+        input_positions = []
+        for i in range(input_size):
+            y = input_start_y + i * input_spacing
+            
+            # Color based on input value
+            if i < len(input_values):
+                input_val = input_values[i]
+                color = self._activation_to_color(input_val)
+            else:
+                input_val = 0
+                color = (100, 150, 200)
+            
+            pygame.draw.circle(screen, color, (int(input_x), int(y)), node_radius)
+            pygame.draw.circle(screen, (255, 255, 255), (int(input_x), int(y)), node_radius, 1)
+            
+            input_positions.append((input_x, y))
+            
+            # Draw input label
+            if i < len(input_labels):
+                label = font.render(input_labels[i], True, (200, 200, 200))
+                screen.blit(label, (input_x - 70, y - 6))
+                
+                # Draw value (smaller, on right of node)
+                value_text = font.render(f"{input_val:.2f}", True, (150, 150, 150))
+                screen.blit(value_text, (input_x + 10, y - 6))
+        
+        # Sample reservoir nodes if too many - FIX: Ensure indices are valid
+        max_display_nodes = 40
+        if reservoir_size > max_display_nodes:
+            # Sample evenly, ensuring we don't exceed reservoir_size - 1
+            display_indices = [min(int(i * reservoir_size / max_display_nodes), reservoir_size - 1) 
+                            for i in range(max_display_nodes)]
+            # Remove duplicates while preserving order
+            seen = set()
+            display_indices = [x for x in display_indices if not (x in seen or seen.add(x))]
+            display_size = len(display_indices)
+        else:
+            display_indices = list(range(reservoir_size))
+            display_size = reservoir_size
+        
+        # Debug print
+        #print(f"Reservoir size: {reservoir_size}, Display indices: {len(display_indices)}, Max index: {max(display_indices) if display_indices else 'N/A'}")
+        
+        # Draw Reservoir Nodes (circular arrangement)
+        reservoir_center_y = content_y + content_height // 2
+        reservoir_radius = min(80, content_height // 3)
+        
+        reservoir_positions = []
+        for i, idx in enumerate(display_indices):
+            angle = (i / display_size) * 2 * np.pi
+            x = reservoir_x + reservoir_radius * np.cos(angle)
+            y = reservoir_center_y + reservoir_radius * np.sin(angle)
+            
+            # Color based on activation value
+            activation = reservoir_state[idx]
+            color = self._activation_to_color(activation)
+            
+            pygame.draw.circle(screen, color, (int(x), int(y)), node_radius)
+            pygame.draw.circle(screen, (255, 255, 255), (int(x), int(y)), node_radius, 1)
+            
+            reservoir_positions.append((x, y))
+        
+        # Create a mapping from reservoir indices to display positions
+        index_to_display = {idx: i for i, idx in enumerate(display_indices)}
+        
+        # ========== DRAW INPUT-TO-RESERVOIR CONNECTIONS ==========
+        input_connections = []
+        for res_idx in display_indices:
+            # Bounds check
+            if res_idx >= reservoir_size or res_idx < 0:
+                continue
+                
+            for inp_idx in range(input_size):
+                # Check array bounds
+                if res_idx < brain.input_weights.shape[0] and inp_idx < brain.input_weights.shape[1]:
+                    weight = brain.input_weights[res_idx, inp_idx]  # [reservoir, input]
+                    if abs(weight) > 0.001:
+                        input_connections.append((inp_idx, res_idx, weight))
+        
+        # Store total before limiting
+        total_input_connections = len(input_connections)
+
+        # Limit if too many
+        max_input_connections = 100
+        if len(input_connections) > max_input_connections:
+            input_connections.sort(key=lambda x: abs(x[2]), reverse=True)
+            input_connections = input_connections[:max_input_connections]
+        
+        # Draw input connections (behind reservoir nodes)
+        for inp_idx, res_idx, weight in input_connections:
+            if res_idx in index_to_display and inp_idx < len(input_positions):
+                res_display_idx = index_to_display[res_idx]
+                if res_display_idx < len(reservoir_positions):
+                    start_pos = input_positions[inp_idx]
+                    end_pos = reservoir_positions[res_display_idx]
+                    
+                    # Color and thickness based on weight
+                    weight_strength = min(abs(weight) / 2.0, 1.0)  # Scale down for visibility
+                    
+                    if weight > 0:
+                        intensity = int(80 + 100 * weight_strength)
+                        line_color = (intensity, intensity // 4, 0)
+                    else:
+                        intensity = int(80 + 100 * weight_strength)
+                        line_color = (0, intensity // 4, intensity)
+                    
+                    line_width = 1
+                    pygame.draw.line(screen, line_color,
+                                (int(start_pos[0]), int(start_pos[1])),
+                                (int(end_pos[0]), int(end_pos[1])), line_width)
+        
+        # ========== DRAW RESERVOIR-TO-RESERVOIR CONNECTIONS ==========
+        reservoir_connections = []
+        for i in display_indices:
+            if i >= reservoir_size or i < 0:
+                continue
+            for j in display_indices:
+                if j >= reservoir_size or j < 0:
+                    continue
+                # Check array bounds
+                if j < brain.reservoir_weights.shape[0] and i < brain.reservoir_weights.shape[1]:
+                    weight = brain.reservoir_weights[j, i]  # [to, from]
+                    if abs(weight) > 0.001:
+                        reservoir_connections.append((i, j, weight))
+        
+        # Store total before limiting
+        total_reservoir_connections = len(reservoir_connections)
+
+        # Limit number of connections if too many
+        max_reservoir_connections = 100
+        if len(reservoir_connections) > max_reservoir_connections:
+            reservoir_connections.sort(key=lambda x: abs(x[2]), reverse=True)
+            reservoir_connections = reservoir_connections[:max_reservoir_connections]
+        
+        # Draw reservoir connections
+        for i, j, weight in reservoir_connections:
+            if i in index_to_display and j in index_to_display:
+                start_idx = index_to_display[i]
+                end_idx = index_to_display[j]
+                
+                if start_idx < len(reservoir_positions) and end_idx < len(reservoir_positions):
+                    start_pos = reservoir_positions[start_idx]
+                    end_pos = reservoir_positions[end_idx]
+                    
+                    # Color based on weight sign and magnitude
+                    weight_strength = min(abs(weight), 1.0)
+                    
+                    if weight > 0:
+                        intensity = int(100 + 155 * weight_strength)
+                        line_color = (intensity, intensity // 3, 0)
+                    else:
+                        intensity = int(100 + 155 * weight_strength)
+                        line_color = (0, intensity // 3, intensity)
+                    
+                    line_width = max(1, int(weight_strength * 2))
+                    
+                    pygame.draw.line(screen, line_color,
+                                (int(start_pos[0]), int(start_pos[1])),
+                                (int(end_pos[0]), int(end_pos[1])), line_width)
+        
+        # Draw Output Nodes (vertically spaced)
+        output_spacing = min(content_height / (output_size + 1), 40)
+        output_start_y = content_y + (content_height - output_spacing * output_size) // 2
+        
+        # Get output activations
+        output_activations = np.dot(reservoir_state, brain.output_weights) + brain.output_bias
+        for j in range(output_size):
+            output_activations[j] = ActivationFunctions.activate(
+                np.array([output_activations[j]]),
+                brain.output_activations[j]
+            )[0]
+        
+        output_labels = ["Angle", "Speed", "Eat", "Garden", "Plant", "Water"]
+        output_positions = []
+        
+        for i in range(output_size):
+            y = output_start_y + i * output_spacing
+            
+            # Color based on activation
+            activation = output_activations[i]
+            color = self._activation_to_color(activation)
+            
+            pygame.draw.circle(screen, color, (int(output_x), int(y)), node_radius + 2)
+            pygame.draw.circle(screen, (255, 255, 255), (int(output_x), int(y)), node_radius + 2, 1)
+            
+            output_positions.append((output_x, y))
+            
+            # Label
+            if i < len(output_labels):
+                label = font.render(output_labels[i], True, (200, 200, 200))
+                screen.blit(label, (output_x + 15, y - 6))
+                
+                # Draw value
+                value_text = font.render(f"{activation:.2f}", True, (150, 150, 150))
+                screen.blit(value_text, (output_x + 80, y - 6))
+        
+        # ========== DRAW RESERVOIR-TO-OUTPUT CONNECTIONS ==========
+        output_connections = []
+        for out_idx in range(output_size):
+            for res_idx in display_indices:
+                if res_idx >= reservoir_size or res_idx < 0:
+                    continue
+                # Check array bounds
+                # output_weights shape is (reservoir_size, output_size)
+                if res_idx < brain.output_weights.shape[0] and out_idx < brain.output_weights.shape[1]:
+                    weight = brain.output_weights[res_idx, out_idx]  # FIXED: [reservoir, output]
+                    if abs(weight) > 0.001:
+                        output_connections.append((res_idx, out_idx, weight))
+
+        # Store total before limiting
+        total_output_connections = len(output_connections)
+
+        # Limit if too many
+        max_output_connections = 100
+        if len(output_connections) > max_output_connections:
+            output_connections.sort(key=lambda x: abs(x[2]), reverse=True)
+            output_connections = output_connections[:max_output_connections]
+
+        # Draw output connections
+        for res_idx, out_idx, weight in output_connections:
+            if res_idx in index_to_display and out_idx < len(output_positions):
+                res_display_idx = index_to_display[res_idx]
+                if res_display_idx < len(reservoir_positions):
+                    start_pos = reservoir_positions[res_display_idx]
+                    end_pos = output_positions[out_idx]
+                    
+                    # Color and thickness based on weight
+                    weight_strength = min(abs(weight) / 2.0, 1.0)
+                    
+                    if weight > 0:
+                        intensity = int(80 + 100 * weight_strength)
+                        line_color = (intensity, intensity // 4, 0)
+                    else:
+                        intensity = int(80 + 100 * weight_strength)
+                        line_color = (0, intensity // 4, intensity)
+                    
+                    line_width = 1
+                    pygame.draw.line(screen, line_color,
+                                (int(start_pos[0]), int(start_pos[1])),
+                                (int(end_pos[0]), int(end_pos[1])), line_width)
+        
+        # Draw connection statistics
+        total_all_connections = total_input_connections + total_reservoir_connections + total_output_connections
+        displayed_connections = len(input_connections) + len(reservoir_connections) + len(output_connections)
+
+        stats_text = font.render(
+            f"Connections: {total_all_connections} ({total_input_connections}→R, {total_reservoir_connections}↔R, {total_output_connections}→O)", 
+            True, (180, 180, 180)
+        )
+        screen.blit(stats_text, (panel_x + 10, panel_y + 50))
+        
+        # Legend
+        legend_y = panel_y + panel_height - 25
+        legend_text = font.render("Activation: ", True, (180, 180, 180))
+        screen.blit(legend_text, (panel_x + 10, legend_y))
+        
+        # Color gradient legend
+        for i in range(5):
+            activation_val = -1 + (i / 4) * 2  # -1 to 1
+            color = self._activation_to_color(activation_val)
+            legend_x = panel_x + 100 + i * 25
+            pygame.draw.circle(screen, color, (legend_x, legend_y + 8), 8)
+
+    def _render_feedforward_brain(self, screen, brain: NeuralNetwork,
+                                panel_x: int, panel_y: int, panel_width: int, panel_height: int, font):
+        """Render feedforward neural network layer by layer."""
+        import pygame
+        
+        node_radius = 6
+        margin = 40
+        content_y = panel_y + 60
+        content_height = panel_height - 80
+        
+        layers = brain.layers
+        num_layers = len(layers)
+        
+        # Calculate horizontal spacing
+        layer_spacing = (panel_width - 2 * margin) / (num_layers - 1) if num_layers > 1 else 0
+        
+        # Store node positions for drawing connections
+        layer_positions = []
+        
+        for layer_idx, layer_size in enumerate(layers):
+            x = panel_x + margin + layer_idx * layer_spacing
+            
+            # Vertical spacing for nodes in this layer
+            node_spacing = min(content_height / (layer_size + 1), 25)
+            start_y = content_y + (content_height - node_spacing * layer_size) // 2
+            
+            positions = []
+            for node_idx in range(layer_size):
+                y = start_y + node_idx * node_spacing
+                
+                # Color based on layer type
+                if layer_idx == 0:
+                    # Input layer - blue
+                    color = (100, 150, 200)
+                elif layer_idx == num_layers - 1:
+                    # Output layer - green/red based on activation
+                    # Approximate activation
+                    color = (100, 200, 100)
+                else:
+                    # Hidden layer - purple
+                    color = (150, 100, 200)
+                
+                pygame.draw.circle(screen, color, (int(x), int(y)), node_radius)
+                pygame.draw.circle(screen, (255, 255, 255), (int(x), int(y)), node_radius, 1)
+                
+                positions.append((x, y))
+            
+            layer_positions.append(positions)
+        
+        # Draw connections between layers (sample to avoid clutter)
+        for layer_idx in range(len(layer_positions) - 1):
+            current_layer = layer_positions[layer_idx]
+            next_layer = layer_positions[layer_idx + 1]
+            
+            # Sample connections
+            max_connections = 50
+            total_possible = len(current_layer) * len(next_layer)
+            
+            if total_possible <= max_connections:
+                # Draw all
+                for start_pos in current_layer:
+                    for end_pos in next_layer:
+                        pygame.draw.line(screen, (60, 60, 80),
+                                    (int(start_pos[0]), int(start_pos[1])),
+                                    (int(end_pos[0]), int(end_pos[1])), 1)
+            else:
+                # Sample randomly
+                for _ in range(max_connections):
+                    start_pos = random.choice(current_layer)
+                    end_pos = random.choice(next_layer)
+                    pygame.draw.line(screen, (60, 60, 80),
+                                (int(start_pos[0]), int(start_pos[1])),
+                                (int(end_pos[0]), int(end_pos[1])), 1)
+
+    def _activation_to_color(self, activation: float) -> Tuple[int, int, int]:
+        """
+        Convert activation value to a color.
+        Negative = blue, Zero = gray, Positive = red/orange
+        """
+        # Clamp activation to -1 to 1 range
+        activation = np.clip(activation, -1, 1)
+        
+        if activation < 0:
+            # Negative: black -> blue
+            intensity = int(255 * abs(activation))
+            return (0, 0, intensity)
+        else:
+            # Positive: black -> red/orange
+            intensity = int(255 * activation)
+            return (intensity, intensity // 2, 0)
     
     def render(self, screen=None, font=None):
         
@@ -2066,7 +3073,7 @@ class Environment:
         
         # Draw gardens (after food, before agents)
         for garden in self.gardens:
-            if not garden.harvested and self.camera.is_visible(garden.x, garden.y):
+            if self.camera.is_visible(garden.x, garden.y):
                 screen_pos = self.camera.world_to_screen(garden.x, garden.y)
                 scaled_radius = max(3, int(self.camera.scale_size(garden.radius)))
                 
@@ -2149,6 +3156,20 @@ class Environment:
                     scaled_radius,
                     outline_width
                 )
+
+                # Draw agent ID nametag BELOW agent (changed from above)
+                if self.camera.zoom > 0.4:
+                    nametag_font = pygame.font.Font(None, max(14, int(16 * self.camera.zoom)))
+                    nametag_text = nametag_font.render(f"#{agent.id}", True, (255, 255, 255))
+                    nametag_rect = nametag_text.get_rect()
+                    nametag_rect.centerx = screen_pos[0]
+                    nametag_rect.top = screen_pos[1] + scaled_radius + 5  # CHANGED: now below agent
+                    
+                    # Background for nametag
+                    bg_rect = nametag_rect.inflate(4, 2)
+                    pygame.draw.rect(screen, (0, 0, 0, 180), bg_rect)
+                    pygame.draw.rect(screen, (200, 200, 200), bg_rect, 1)
+                    screen.blit(nametag_text, nametag_rect)
                 
                 # Draw status bars (only if zoomed in enough)
                 if self.camera.zoom > 0.5:
@@ -2436,6 +3457,14 @@ class Environment:
         water_label = tiny_font.render("Water", True, (255, 255, 255))
         screen.blit(water_label, (40, legend_y + 33))
         
+        if self.show_brain_viz and self.selected_agent:
+            # Store close rect for click detection (will be used in simulation loop)
+            self.brain_viz_close_rect = self.render_brain_visualization(
+                screen, viewport_width, viewport_height
+            )
+        else:
+            self.brain_viz_close_rect = None
+
         # Update display
         pygame.display.flip()
         
@@ -2629,6 +3658,9 @@ class Simulation:
         screen = None
         font = None
         clock = pygame.time.Clock()
+
+        viewport_width = 1000
+        viewport_height = 600
         
         print("Starting simulation with pygame rendering...")
         print(f"World size: {self.environment.width}x{self.environment.height}")
@@ -2643,6 +3675,8 @@ class Simulation:
         print("  Arrow Keys - Scroll agent list")
         if auto_save_interval > 0:
             print(f"  Auto-save every {auto_save_interval} generations")
+
+        brain_viz_close_rect = None  # Track close button
         
         try:
             while self.running:
@@ -2669,6 +3703,26 @@ class Simulation:
                         elif event.key == pygame.K_DOWN:
                             self.environment.scroll_offset += 30
                     
+                    # Mouse click handling
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        if event.button == 1:  # Left click
+                            print(f"🖱️  Mouse clicked at {mouse_pos}")
+                            
+                            # Check if clicking close button on brain viz
+                            if self.environment.show_brain_viz and self.environment.brain_viz_close_rect:
+                                print(f"   Brain viz is open, close rect: {self.environment.brain_viz_close_rect}")
+                                if self.environment.brain_viz_close_rect.collidepoint(mouse_pos):
+                                    print("   ✓ Clicked close button - closing brain viz")
+                                    self.environment.show_brain_viz = False
+                                    self.environment.selected_agent = None
+                                    continue  # Don't process other clicks
+                            
+                            # Check if clicking agent list (only if not closing brain viz)
+                            self.environment.handle_agent_list_click(
+                                mouse_pos[0], mouse_pos[1], 
+                                viewport_width, viewport_height
+                            )
+
                     # Mouse wheel zoom
                     elif event.type == pygame.MOUSEWHEEL:
                         # Only zoom if mouse is over main viewport (not panel)
@@ -2727,6 +3781,14 @@ class Simulation:
                 
                 # Render
                 screen, font = self.environment.render(screen, font)
+
+                # NEW: Render brain visualization overlay
+                """if self.environment.show_brain_viz and self.environment.selected_agent:
+                    brain_viz_close_rect = self.environment.render_brain_visualization(
+                        screen, viewport_width, viewport_height
+                    )
+                else:
+                    brain_viz_close_rect = None"""
                 
                 # Control frame rate
                 clock.tick(self.fps)
@@ -2771,7 +3833,7 @@ class Simulation:
     
     def save_state(self, filename: str):
         """
-        UPDATED: Save current simulation state including Hall of Fame and Gardens.
+        Save current simulation state including Hall of Fame, Gardens, and agent stats.
         
         Args:
             filename: File to save to
@@ -2787,28 +3849,61 @@ class Simulation:
             },
             'agents': [],
             'hall_of_fame': [],
-            'gardens': [],  # NEW: Save gardens
+            'gardens': [],
         }
         
-        # Save agent brains
+        # Save agent brains AND stats
         for agent in self.environment.agents:
             agent_data = {
-                'brain_weights': [w.tolist() for w in agent.brain.weights],
-                'brain_biases': [b.tolist() for b in agent.brain.biases],
-                'brain_layers': agent.brain.layers,
+                # Recurrent network specific fields
+                'brain_type': 'recurrent',
+                'input_weights': agent.brain.input_weights.tolist(),
+                'reservoir_weights': agent.brain.reservoir_weights.tolist(),
+                'output_weights': agent.brain.output_weights.tolist(),
+                'output_bias': agent.brain.output_bias.tolist(),
+                'reservoir_size': agent.brain.reservoir_size,
+                'spectral_radius': agent.brain.spectral_radius,
+                'sparsity': agent.brain.sparsity,
+                'reservoir_activations': [act.value for act in agent.brain.reservoir_activations],
+                'output_activations': [act.value for act in agent.brain.output_activations],
+                # Agent stats (UPDATED: save all current stats)
+                'agent_id': agent.id,
+                'alive': agent.alive,
+                'health': agent.health,
+                'food': agent.food,
+                'water': agent.water,
+                'food_inventory': agent.food_inventory,
+                'age': agent.age,
                 'fitness': agent.fitness,
                 'food_collected': agent.food_collected,
                 'water_collected': agent.water_collected,
+                'children': agent.children,
                 'generation_born': agent.generation_born,
+                'gardens_created': agent.gardens_created,
+                'gardens_planted': agent.gardens_planted,
+                'gardens_watered': agent.gardens_watered,
+                'gardens_harvested': agent.gardens_harvested,
+                # Agent position and velocity
+                'x': agent.circle.x,
+                'y': agent.circle.y,
+                'velocity_x': agent.circle.velocity_x,
+                'velocity_y': agent.circle.velocity_y,
             }
             state['agents'].append(agent_data)
         
         # Save Hall of Fame
         for hof_record in self.environment.hall_of_fame:
             hof_data = {
-                'brain_weights': [w.tolist() for w in hof_record['brain'].weights],
-                'brain_biases': [b.tolist() for b in hof_record['brain'].biases],
-                'brain_layers': hof_record['brain'].layers,
+                'brain_type': 'recurrent',
+                'input_weights': hof_record['brain'].input_weights.tolist(),
+                'reservoir_weights': hof_record['brain'].reservoir_weights.tolist(),
+                'output_weights': hof_record['brain'].output_weights.tolist(),
+                'output_bias': hof_record['brain'].output_bias.tolist(),
+                'reservoir_size': hof_record['brain'].reservoir_size,
+                'spectral_radius': hof_record['brain'].spectral_radius,
+                'sparsity': hof_record['brain'].sparsity,
+                'reservoir_activations': [act.value for act in hof_record['brain'].reservoir_activations],
+                'output_activations': [act.value for act in hof_record['brain'].output_activations],
                 'fitness': hof_record['fitness'],
                 'generation': hof_record['generation'],
                 'food_collected': hof_record['food_collected'],
@@ -2817,10 +3912,11 @@ class Simulation:
                 'children': hof_record['children'],
                 'architecture': hof_record['architecture'],
                 'complexity': hof_record['complexity'],
+                'agent_id': hof_record.get('agent_id'),
             }
             state['hall_of_fame'].append(hof_data)
         
-        # NEW: Save gardens
+        # Save gardens
         for garden in self.environment.gardens:
             garden_data = {
                 'x': garden.x,
@@ -2836,7 +3932,8 @@ class Simulation:
                 'food_multiplier': garden.food_multiplier,
                 'harvested': garden.harvested,
                 'times_harvested': garden.times_harvested,
-                'max_harvests': garden.max_harvests,
+                'last_interaction_timestep': garden.last_interaction_timestep,
+                'inactivity_threshold': garden.inactivity_threshold,
             }
             state['gardens'].append(garden_data)
         
@@ -2851,7 +3948,7 @@ class Simulation:
 
     def load_state(self, filename: str):
         """
-        UPDATED: Load simulation state from file including Hall of Fame and Gardens.
+        Load simulation state from file including Hall of Fame, Gardens, and agent stats.
         
         Args:
             filename: File to load from
@@ -2865,28 +3962,110 @@ class Simulation:
         self.environment.next_agent_id = state['environment']['next_agent_id']
         self.environment.best_fitness_ever = state['environment']['best_fitness_ever']
         
-        # Restore agent brains
-        brains = []
-        for agent_data in state['agents']:
-            layers = agent_data['brain_layers']
-            brain = NeuralNetwork(layers[0], layers[1:-1], layers[-1])
-            brain.weights = [np.array(w) for w in agent_data['brain_weights']]
-            brain.biases = [np.array(b) for b in agent_data['brain_biases']]
-            brains.append(brain)
-        
-        # Respawn agents with loaded brains
+        # Clear existing agents
         self.environment.agents = []
-        self.environment._spawn_agents(len(brains), brains)
+        max_agent_id = -1
         
+        # Restore agents with full state
+        for agent_data in state['agents']:
+            if agent_data.get('brain_type') == 'recurrent':
+                # Load recurrent network
+                brain = RecurrentNeuralNetwork(
+                    input_size=input_size,
+                    reservoir_size=agent_data['reservoir_size'],
+                    output_size=output_size,
+                    spectral_radius=agent_data['spectral_radius'],
+                    sparsity=agent_data['sparsity']
+                )
+                brain.input_weights = np.array(agent_data['input_weights'])
+                brain.reservoir_weights = np.array(agent_data['reservoir_weights'])
+                brain.output_weights = np.array(agent_data['output_weights'])
+                brain.output_bias = np.array(agent_data['output_bias'])
+                brain.reservoir_activations = [ActivationType(act) for act in agent_data['reservoir_activations']]
+                brain.output_activations = [ActivationType(act) for act in agent_data['output_activations']]
+                brain.reset_state()  # Start with clean state
+            else:
+                # Fallback for old feedforward networks
+                layers = agent_data['brain_layers']
+                brain = NeuralNetwork(layers[0], layers[1:-1], layers[-1])
+                brain.weights = [np.array(w) for w in agent_data['brain_weights']]
+                brain.biases = [np.array(b) for b in agent_data['brain_biases']]
+            
+            # Create agent with saved position
+            x = agent_data.get('x', random.uniform(50, self.environment.width - 50))
+            y = agent_data.get('y', random.uniform(50, self.environment.height - 50))
+            agent_id = agent_data.get('agent_id', 0)
+            
+            agent = Agent(
+                agent_id=agent_id,
+                x=x,
+                y=y,
+                brain=brain,
+                generation_born=agent_data.get('generation_born', self.environment.generation)
+            )
+            max_agent_id = max(max_agent_id, agent_id)
+            
+            # Restore all agent stats (UPDATED)
+            agent.alive = agent_data.get('alive', True)
+            agent.health = agent_data.get('health', agent.max_health)
+            agent.food = agent_data.get('food', agent.max_food)
+            agent.water = agent_data.get('water', agent.max_water)
+            agent.food_inventory = agent_data.get('food_inventory', 0)
+            agent.age = agent_data.get('age', 0)
+            agent.fitness = agent_data.get('fitness', 0)  # RESTORE FITNESS
+            agent.food_collected = agent_data.get('food_collected', 0)
+            agent.water_collected = agent_data.get('water_collected', 0)
+            agent.children = agent_data.get('children', 0)
+            agent.gardens_created = agent_data.get('gardens_created', 0)
+            agent.gardens_planted = agent_data.get('gardens_planted', 0)
+            agent.gardens_watered = agent_data.get('gardens_watered', 0)
+            agent.gardens_harvested = agent_data.get('gardens_harvested', 0)
+            
+            # Restore velocity
+            agent.circle.velocity_x = agent_data.get('velocity_x', 0)
+            agent.circle.velocity_y = agent_data.get('velocity_y', 0)
+            
+            self.environment.agents.append(agent)
+        
+        self.environment.next_agent_id = max_agent_id + 1
+
         # Restore Hall of Fame
         self.environment.hall_of_fame = []
         if 'hall_of_fame' in state:
             for hof_data in state['hall_of_fame']:
-                layers = hof_data['brain_layers']
-                brain = NeuralNetwork(layers[0], layers[1:-1], layers[-1])
-                brain.weights = [np.array(w) for w in hof_data['brain_weights']]
-                brain.biases = [np.array(b) for b in hof_data['brain_biases']]
+                # Check if this is a recurrent network or feedforward network
+                if hof_data.get('brain_type') == 'recurrent':
+                    # Load recurrent network from Hall of Fame
+                    brain = RecurrentNeuralNetwork(
+                        input_size=input_size,
+                        reservoir_size=hof_data['reservoir_size'],
+                        output_size=output_size,
+                        spectral_radius=hof_data['spectral_radius'],
+                        sparsity=hof_data['sparsity']
+                    )
+                    brain.input_weights = np.array(hof_data['input_weights'])
+                    brain.reservoir_weights = np.array(hof_data['reservoir_weights'])
+                    brain.output_weights = np.array(hof_data['output_weights'])
+                    brain.output_bias = np.array(hof_data['output_bias'])
+                    brain.reservoir_activations = [ActivationType(act) for act in hof_data['reservoir_activations']]
+                    brain.output_activations = [ActivationType(act) for act in hof_data['output_activations']]
+                    brain.reset_state()  # Start with clean state
+                    
+                    # Get architecture string for recurrent network
+                    architecture = brain.get_architecture_string()
+                    complexity = brain.get_complexity()
+                else:
+                    # Fallback for old feedforward networks (backwards compatibility)
+                    layers = hof_data['brain_layers']
+                    brain = NeuralNetwork(layers[0], layers[1:-1], layers[-1])
+                    brain.weights = [np.array(w) for w in hof_data['brain_weights']]
+                    brain.biases = [np.array(b) for b in hof_data['brain_biases']]
+                    
+                    # Use stored architecture or generate it
+                    architecture = hof_data.get('architecture', brain.get_architecture_string())
+                    complexity = hof_data.get('complexity', brain.get_complexity())
                 
+                # Create Hall of Fame record
                 hof_record = {
                     'brain': brain,
                     'fitness': hof_data['fitness'],
@@ -2895,12 +4074,13 @@ class Simulation:
                     'water_collected': hof_data['water_collected'],
                     'age': hof_data['age'],
                     'children': hof_data['children'],
-                    'architecture': hof_data['architecture'],
-                    'complexity': hof_data['complexity'],
+                    'architecture': architecture,
+                    'complexity': complexity,
+                    'agent_id': hof_data.get('agent_id')
                 }
                 self.environment.hall_of_fame.append(hof_record)
         
-        # NEW: Restore gardens
+        # Restore gardens
         self.environment.gardens = []
         if 'gardens' in state:
             for garden_data in state['gardens']:
@@ -2919,15 +4099,24 @@ class Simulation:
                 garden.food_multiplier = garden_data.get('food_multiplier', 5)
                 garden.harvested = garden_data.get('harvested', False)
                 garden.times_harvested = garden_data.get('times_harvested', 0)
-                garden.max_harvests = garden_data.get('max_harvests', 20)
+                garden.last_interaction_timestep = garden_data.get('last_interaction_timestep', 0)
+                garden.inactivity_threshold = garden_data.get('inactivity_threshold', 10000)
                 
                 self.environment.gardens.append(garden)
         
         print(f"\n📂 Simulation state loaded from {filename}")
         print(f"   - Generation {self.environment.generation}")
-        print(f"   - {len(brains)} agents restored")
+        print(f"   - {len(self.environment.agents)} agents restored")
         print(f"   - {len(self.environment.hall_of_fame)} Hall of Fame members")
         print(f"   - {len(self.environment.gardens)} gardens restored")
+        
+        # Print agent stats summary
+        if self.environment.agents:
+            total_fitness = sum(a.fitness for a in self.environment.agents)
+            avg_fitness = total_fitness / len(self.environment.agents)
+            max_fitness = max(a.fitness for a in self.environment.agents)
+            print(f"   - Agent fitness: avg={avg_fitness:.2f}, max={max_fitness:.2f}")
+        
         if self.environment.hall_of_fame:
             best_hof = self.environment.hall_of_fame[0]
             print(f"   - Best ever: {best_hof['fitness']:.2f} (Gen {best_hof['generation']}, {best_hof['architecture']})")
@@ -2979,13 +4168,18 @@ def run_simulation_with_saves():
     """
     Example: Run simulation with saving and loading.
     """
+    load_previous = True  # Set to True to continue from save
     # Create environment and simulation
-    env = Environment(width=3000, height=3000, num_agents=0)
-    sim = Simulation(env, 2)
-    env.evolve_population()
+    if load_previous:
+        env = Environment(width=3000, height=3000, num_agents=30)
+    else:
+        env = Environment(width=3000, height=3000, num_agents=0)
+        env.evolve_population()
+    sim = Simulation(env, 1)
+    
     
     # Option 1: Load previous progress
-    load_previous = True  # Set to True to continue from save
+    
     if load_previous:
         try:
             sim.load_state('final_state.pkl')
@@ -3032,6 +4226,46 @@ def run_quick_test():
     
     print("\nQuick test complete!")
 
+def test_recurrent_network():
+    """Test the recurrent neural network."""
+    
+    # Create network
+    net = RecurrentNeuralNetwork(
+        input_size=14,
+        reservoir_size=50,
+        output_size=6,
+        spectral_radius=0.9,
+        sparsity=0.1
+    )
+    
+    print("Network created:")
+    print(f"  Architecture: {net.get_architecture_string()}")
+    print(f"  Complexity: {net.get_complexity()} parameters")
+    print(f"  Spectral radius: {net.spectral_radius}")
+    
+    # Test forward pass
+    test_input = np.random.randn(14)
+    
+    print("\nTesting temporal dynamics (should show recurrence):")
+    for i in range(5):
+        output = net.forward(test_input)
+        print(f"  Step {i}: Output = {output[:3]}... (first 3 values)")
+    
+    # Test mutation
+    print("\nTesting mutation:")
+    original_arch = net.get_architecture_string()
+    net.mutate(structural_mutation_rate=1.0)  # Force structural change
+    print(f"  Before: {original_arch}")
+    print(f"  After: {net.get_architecture_string()}")
+    
+    # Test activation function diversity
+    print("\nActivation functions in use:")
+    activation_counts = {}
+    for act in net.reservoir_activations:
+        activation_counts[act.value] = activation_counts.get(act.value, 0) + 1
+    for act_type, count in activation_counts.items():
+        print(f"  {act_type}: {count} neurons")
+
 
 if __name__ == "__main__":
     # Choose which mode to run:
@@ -3043,3 +4277,4 @@ if __name__ == "__main__":
     #run_quick_test()
     pygame.init()
     run_simulation_with_saves()
+    #test_recurrent_network()
