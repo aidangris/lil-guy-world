@@ -13,7 +13,7 @@ from enum import Enum
 # NEURAL NETWORK
 # ============================================================================
 
-input_size = 14
+input_size = 55  # 8 sectors × 6 values + 7 self stats
 output_size = 6
 
 class ActivationType(Enum):
@@ -1000,6 +1000,11 @@ class Agent:
         self.water_collected = 0  # NEW: Track water consumption
         self.age = 0
         self.children = 0
+        self.current_intent = 0
+        self.food_shared = 0
+        self.food_received = 0
+        self.damage_dealt = 0
+        self.damage_taken = 0
         
         # Reproduction parameters
         self.reproduction_cooldown = 3000
@@ -1026,153 +1031,303 @@ class Agent:
     
     def sense(self, environment: 'Environment') -> np.ndarray:
         """
-        Gather sensory information from the environment (ANGLE-BASED).
+        Gather sensory information from the environment (RADIAL SECTOR VISION).
         
-        Sensor inputs (14 total):
-        0: Angle to nearest food (normalized -1 to 1)
-        1: Angle to second nearest food (normalized -1 to 1)
-        2: Angle to nearest water (normalized -1 to 1)
-        3: Distance to nearest water (0 to 1)
-        4: Angle to nearest agent (normalized -1 to 1)
-        5: Angle to second nearest agent (normalized -1 to 1)
-        6: Distance to nearest wall (normalized 0-1, closer = lower value)
-        7: Health level (normalized 0-1)
-        8: Food level (normalized 0-1)
-        9: Water level (normalized 0-1)
-        10: Food inventory (normalized 0-1)
-        11: Angle to nearest garden (normalized -1 to 1)
-        12: Nearest garden state (0=empty, 0.33=planted, 0.66=watered, 1=ready)
-        13: Bias input (always 1.0)
+        Sensor inputs (55 total):
         
-        Args:
-            environment: The environment to sense
-            
-        Returns:
-            Sensor input vector (14 values)
+        === RADIAL SECTORS (48 inputs) ===
+        8 sectors × 6 values each:
+        - Sector 0 (0°-45°):   [food_dist, water_dist, agent_dist, agent_intent, garden_dist, garden_status]
+        - Sector 1 (45°-90°):  [food_dist, water_dist, agent_dist, agent_intent, garden_dist, garden_status]
+        - Sector 2 (90°-135°): [food_dist, water_dist, agent_dist, agent_intent, garden_dist, garden_status]
+        - Sector 3 (135°-180°): [food_dist, water_dist, agent_dist, agent_intent, garden_dist, garden_status]
+        - Sector 4 (180°-225°): [food_dist, water_dist, agent_dist, agent_intent, garden_dist, garden_status]
+        - Sector 5 (225°-270°): [food_dist, water_dist, agent_dist, agent_intent, garden_dist, garden_status]
+        - Sector 6 (270°-315°): [food_dist, water_dist, agent_dist, agent_intent, garden_dist, garden_status]
+        - Sector 7 (315°-360°): [food_dist, water_dist, agent_dist, agent_intent, garden_dist, garden_status]
+        
+        All distances normalized to 0-1 range (0 = far/none, 1 = very close)
+        Agent intent: -1 (hostile) to +1 (friendly)
+        Garden status: 0=empty, 0.33=planted, 0.66=watered, 1.0=ready to harvest
+        Detection range: 400 pixels
+        
+        === SELF STATE (7 inputs) ===
+        48: Health level (0-1)
+        49: Food level (0-1)
+        50: Water level (0-1)
+        51: Food inventory (0-1)
+        52: Distance to nearest wall (0-1, higher = closer)
+        53: Relative age (0-1, 0=youngest, 1=oldest)
+        54: Bias (always 1.0)
         """
-        
-        
         sensors = np.zeros(input_size)
         
-        # === FOOD SENSING (2 nearest) ===
-        food_list = [f for f in environment.food if not f.consumed]
-        if food_list:
-            food_distances = [(f, self.circle.distance_to_point(f.x, f.y)) for f in food_list]
-            food_distances.sort(key=lambda x: x[1])
-            
-            # Nearest food
-            nearest_food = food_distances[0][0]
-            sensors[0] = self._angle_to_target(nearest_food.x, nearest_food.y)
-            
-            # Second nearest food
-            if len(food_distances) > 1:
-                second_food = food_distances[1][0]
-                sensors[1] = self._angle_to_target(second_food.x, second_food.y)
-            else:
-                sensors[1] = 0.0
-        else:
-            sensors[0] = 0.0
-            sensors[1] = 0.0
+        # === RADIAL SECTOR VISION ===
+        num_sectors = 8
+        sector_angle = 2 * np.pi / num_sectors
+        max_detection_range = 400.0
         
-        # === WATER SENSING (angle + distance to nearest) ===
-        water_list = [w for w in environment.water if not w.depleted]
-        if water_list:
-            water_distances = [(w, self.circle.distance_to_point(w.x, w.y)) for w in water_list]
-            water_distances.sort(key=lambda x: x[1])
+        for sector_idx in range(num_sectors):
+            angle_start = sector_idx * sector_angle
+            angle_end = (sector_idx + 1) * sector_angle
             
-            # Nearest water
-            nearest_water = water_distances[0][0]
-            nearest_water_distance = water_distances[0][1]
+            base_idx = sector_idx * 6
             
-            # Angle to nearest water
-            sensors[2] = self._angle_to_target(nearest_water.x, nearest_water.y)
+            # Find nearest food in this sector
+            nearest_food_dist = self._find_nearest_in_sector(
+                environment.food, angle_start, angle_end, max_detection_range,
+                filter_fn=lambda f: not f.consumed
+            )
+            sensors[base_idx + 0] = nearest_food_dist
             
-            # Distance to nearest water (normalized, inverted so closer = higher value)
-            # Use a max distance for normalization (e.g., 1000 pixels)
-            max_sense_distance = 1000.0
-            normalized_distance = min(nearest_water_distance / max_sense_distance, 1.0)
-            sensors[3] = 1.0 - normalized_distance  # Invert: closer = higher value
-        else:
-            sensors[2] = 0.0
-            sensors[3] = 0.0  # No water available
+            # Find nearest water in this sector
+            nearest_water_dist = self._find_nearest_in_sector(
+                environment.water, angle_start, angle_end, max_detection_range,
+                filter_fn=lambda w: not w.depleted
+            )
+            sensors[base_idx + 1] = nearest_water_dist
+            
+            # Find nearest agent in this sector (returns distance and intent)
+            nearest_agent_dist, nearest_agent_intent = self._find_nearest_agent_in_sector(
+                environment.agents, angle_start, angle_end, max_detection_range
+            )
+            sensors[base_idx + 2] = nearest_agent_dist
+            sensors[base_idx + 3] = nearest_agent_intent
+            
+            # Find nearest garden in this sector (returns distance and status)
+            nearest_garden_dist, nearest_garden_status = self._find_nearest_garden_in_sector(
+                environment.gardens, angle_start, angle_end, max_detection_range
+            )
+            sensors[base_idx + 4] = nearest_garden_dist
+            sensors[base_idx + 5] = nearest_garden_status
         
-        # === AGENT SENSING (2 nearest within 300px range) ===
-        agent_detection_range = 300.0  # Only detect agents within this range
+        # === SELF STATE ===
+        base_idx = num_sectors * 6  # 48
         
-        other_agents = [a for a in environment.agents if a.id != self.id and a.alive]
-        if other_agents:
-            # Filter to only nearby agents
-            agent_distances = [(a, self.circle.distance_to(a.circle)) for a in other_agents]
-            nearby_agents = [(a, dist) for a, dist in agent_distances if dist <= agent_detection_range]
-            nearby_agents.sort(key=lambda x: x[1])
-            
-            if nearby_agents:
-                # Nearest nearby agent
-                nearest_agent = nearby_agents[0][0]
-                sensors[4] = self._angle_to_target(nearest_agent.circle.x, nearest_agent.circle.y)
-                
-                # Second nearest nearby agent
-                if len(nearby_agents) > 1:
-                    second_agent = nearby_agents[1][0]
-                    sensors[5] = self._angle_to_target(second_agent.circle.x, second_agent.circle.y)
-                else:
-                    sensors[5] = 0.0
-            else:
-                # No agents within detection range
-                sensors[4] = 0.0
-                sensors[5] = 0.0
-        else:
-            sensors[4] = 0.0
-            sensors[5] = 0.0
+        sensors[base_idx + 0] = self.health / self.max_health
+        sensors[base_idx + 1] = self.food / self.max_food
+        sensors[base_idx + 2] = self.water / self.max_water
+        sensors[base_idx + 3] = self.food_inventory / self.max_inventory
         
-        # === SELF SENSING ===
-        # Distance to nearest wall (NEW)
+        # Distance to nearest wall
         dist_to_left = self.circle.x
         dist_to_right = environment.width - self.circle.x
         dist_to_top = self.circle.y
         dist_to_bottom = environment.height - self.circle.y
-        
         nearest_wall_distance = min(dist_to_left, dist_to_right, dist_to_top, dist_to_bottom)
         
-        # Normalize: use a reference distance (e.g., 500 pixels)
-        # Closer to wall = lower value, far from wall = higher value
         max_wall_distance = 500.0
-        sensors[6] = 1 - np.clip(nearest_wall_distance / max_wall_distance, 0, 1)
-        if sensors[6] > 0.95:
-            sensors[6] += random.uniform(-2, 2)
+        sensors[base_idx + 4] = 1.0 - np.clip(nearest_wall_distance / max_wall_distance, 0, 1)
         
-        # Health level (normalized)
-        sensors[7] = self.health / self.max_health
-        
-        sensors[8] = self.food / self.max_food
-        sensors[9] = self.water / self.max_water
-        sensors[10] = self.food_inventory / self.max_inventory
-
-        # === GARDEN SENSING ===
-        garden_list = [g for g in environment.gardens if not g.harvested]
-        if garden_list:
-            garden_distances = [(g, self.circle.distance_to_point(g.x, g.y)) for g in garden_list]
-            garden_distances.sort(key=lambda x: x[1])
-            
-            nearest_garden = garden_distances[0][0]
-            sensors[11] = self._angle_to_target(nearest_garden.x, nearest_garden.y)
-            
-            # Garden state encoding
-            if not nearest_garden.planted:
-                sensors[12] = 0.0  # Empty plot
-            elif nearest_garden.planted and not nearest_garden.watered:
-                sensors[12] = 0.33  # Planted but needs water
-            elif nearest_garden.planted and nearest_garden.watered and not nearest_garden.is_ready_to_harvest():
-                sensors[12] = 0.66  # Growing
+        # Relative age (0 = youngest, 1 = oldest agent)
+        alive_agents = [a for a in environment.agents if a.alive]
+        if alive_agents:
+            max_age = max(a.age for a in alive_agents)
+            if max_age > 0:
+                sensors[base_idx + 5] = self.age / max_age
             else:
-                sensors[12] = 1.0  # Ready to harvest
+                sensors[base_idx + 5] = 0.0
         else:
-            sensors[11] = 0.0
-            sensors[12] = 0.0
-
-        sensors[13] = 1.0  # Bias
+            sensors[base_idx + 5] = 0.0
         
+        sensors[base_idx + 6] = 1.0  # Bias
+    
         return sensors
+
+    def _find_nearest_in_sector(self, objects: list, angle_start: float, angle_end: float,
+                                max_distance: float, filter_fn=None, is_agent: bool = False) -> float:
+        """
+        Find the nearest object within a radial sector.
+        
+        Args:
+            objects: List of objects to search
+            angle_start: Start angle of sector (radians)
+            angle_end: End angle of sector (radians)
+            max_distance: Maximum detection distance
+            filter_fn: Optional filter function
+            is_agent: True if objects are agents (different position access)
+            
+        Returns:
+            Normalized distance (0 = far/none, 1 = very close)
+        """
+        if filter_fn:
+            objects = [obj for obj in objects if filter_fn(obj)]
+        
+        if not objects:
+            return 0.0
+        
+        nearest_distance = max_distance
+        
+        for obj in objects:
+            # Get object position
+            if is_agent:
+                obj_x, obj_y = obj.circle.x, obj.circle.y
+            else:
+                obj_x, obj_y = obj.x, obj.y
+            
+            # Calculate angle to object
+            dx = obj_x - self.circle.x
+            dy = obj_y - self.circle.y
+            distance = np.sqrt(dx**2 + dy**2)
+            
+            # Skip if too far
+            if distance > max_distance:
+                continue
+            
+            # Calculate angle
+            angle = np.arctan2(dy, dx)
+            if angle < 0:
+                angle += 2 * np.pi
+            
+            # Check if in sector (handle wraparound at 0/2π)
+            in_sector = False
+            if angle_end > angle_start:
+                # Normal case
+                in_sector = angle_start <= angle < angle_end
+            else:
+                # Wraparound case (sector crosses 0°)
+                in_sector = angle >= angle_start or angle < angle_end
+            
+            if in_sector and distance < nearest_distance:
+                nearest_distance = distance
+        
+        # Normalize: closer = higher value (1.0 at distance 0, 0.0 at max_distance)
+        if nearest_distance >= max_distance:
+            return 0.0
+        else:
+            return 1.0 - (nearest_distance / max_distance)
+        
+    def _find_nearest_agent_in_sector(self, agents: list, angle_start: float, angle_end: float,
+                                   max_distance: float) -> Tuple[float, float]:
+        """
+        Find the nearest agent within a radial sector and return distance + intent.
+        
+        Args:
+            agents: List of agents to search
+            angle_start: Start angle of sector (radians)
+            angle_end: End angle of sector (radians)
+            max_distance: Maximum detection distance
+            
+        Returns:
+            Tuple of (normalized_distance, intent)
+            - normalized_distance: 0 = far/none, 1 = very close
+            - intent: -1 = hostile, 0 = neutral, +1 = friendly
+        """
+        # Filter to other alive agents
+        other_agents = [a for a in agents if a.id != self.id and a.alive]
+        
+        if not other_agents:
+            return (0.0, 0.0)
+        
+        nearest_distance = max_distance
+        nearest_agent = None
+        
+        for agent in other_agents:
+            obj_x, obj_y = agent.circle.x, agent.circle.y
+            
+            # Calculate angle to agent
+            dx = obj_x - self.circle.x
+            dy = obj_y - self.circle.y
+            distance = np.sqrt(dx**2 + dy**2)
+            
+            # Skip if too far
+            if distance > max_distance:
+                continue
+            
+            # Calculate angle
+            angle = np.arctan2(dy, dx)
+            if angle < 0:
+                angle += 2 * np.pi
+            
+            # Check if in sector (handle wraparound at 0/2π)
+            in_sector = False
+            if angle_end > angle_start:
+                in_sector = angle_start <= angle < angle_end
+            else:
+                in_sector = angle >= angle_start or angle < angle_end
+            
+            if in_sector and distance < nearest_distance:
+                nearest_distance = distance
+                nearest_agent = agent
+        
+        # Return normalized distance and intent
+        if nearest_agent is None:
+            return (0.0, 0.0)
+        else:
+            normalized_dist = 1.0 - (nearest_distance / max_distance)
+            intent = nearest_agent.current_intent  # Get the agent's current intent
+            return (normalized_dist, intent)
+        
+    def _find_nearest_garden_in_sector(self, gardens: list, angle_start: float, angle_end: float,
+                                    max_distance: float) -> Tuple[float, float]:
+        """
+        Find the nearest garden within a radial sector and return distance + status.
+        
+        Args:
+            gardens: List of gardens to search
+            angle_start: Start angle of sector (radians)
+            angle_end: End angle of sector (radians)
+            max_distance: Maximum detection distance
+            
+        Returns:
+            Tuple of (normalized_distance, status)
+            - normalized_distance: 0 = far/none, 1 = very close
+            - status: 0=empty, 0.33=planted, 0.66=watered, 1.0=ready
+        """
+        # Filter to non-harvested gardens
+        active_gardens = [g for g in gardens if not g.harvested]
+        
+        if not active_gardens:
+            return (0.0, 0.0)
+        
+        nearest_distance = max_distance
+        nearest_garden = None
+        
+        for garden in active_gardens:
+            obj_x, obj_y = garden.x, garden.y
+            
+            # Calculate angle to garden
+            dx = obj_x - self.circle.x
+            dy = obj_y - self.circle.y
+            distance = np.sqrt(dx**2 + dy**2)
+            
+            # Skip if too far
+            if distance > max_distance:
+                continue
+            
+            # Calculate angle
+            angle = np.arctan2(dy, dx)
+            if angle < 0:
+                angle += 2 * np.pi
+            
+            # Check if in sector (handle wraparound at 0/2π)
+            in_sector = False
+            if angle_end > angle_start:
+                in_sector = angle_start <= angle < angle_end
+            else:
+                in_sector = angle >= angle_start or angle < angle_end
+            
+            if in_sector and distance < nearest_distance:
+                nearest_distance = distance
+                nearest_garden = garden
+        
+        # Return normalized distance and status
+        if nearest_garden is None:
+            return (0.0, 0.0)
+        else:
+            normalized_dist = 1.0 - (nearest_distance / max_distance)
+            
+            # Encode garden status
+            if not nearest_garden.planted:
+                status = 0.0  # Empty plot
+            elif nearest_garden.planted and not nearest_garden.watered:
+                status = 0.33  # Planted but needs water
+            elif nearest_garden.planted and nearest_garden.watered and not nearest_garden.is_ready_to_harvest():
+                status = 0.66  # Growing
+            else:
+                status = 1.0  # Ready to harvest
+            
+            return (normalized_dist, status)
 
     def _angle_to_target(self, target_x: float, target_y: float) -> float:
         """Calculate normalized angle to a target (-1 to 1)."""
@@ -1187,13 +1342,13 @@ class Agent:
     
     def act(self, outputs: np.ndarray, environment: 'Environment'):
         """
-        Convert neural network outputs to actions using ANGLE and SPEED.
+        Convert neural network outputs to actions.
         
         Args:
             outputs: Neural network output vector (6 total)
                 [0]: Movement angle (-1 to 1, maps to -π to π)
                 [1]: Movement speed (-1 to 1, normalized to 0-1)
-                [2]: Eat from inventory (>0.5 triggers eating)
+                [2]: Intent signal (-1 = hostile, +1 = friendly)
                 [3]: Create garden (>0.5 triggers)
                 [4]: Plant in garden (>0.5 triggers)
                 [5]: Water garden (>0.5 triggers)
@@ -1211,10 +1366,8 @@ class Agent:
         self.circle.velocity_x = np.cos(angle) * speed
         self.circle.velocity_y = np.sin(angle) * speed
 
-        # Eat from inventory (commented out - auto-eating is handled in update_resources)
-        eat_signal = outputs[2]
-        # if eat_signal > 0.5 and self.food_inventory > 0:
-        #     self.eat_from_inventory()
+        # Intent signal (output 2) - store for other agents to sense
+        self.current_intent = np.clip(outputs[2], -1.0, 1.0)
 
         # Create garden
         create_garden_signal = outputs[3]
@@ -1449,12 +1602,21 @@ class Agent:
         
         # Create child brain through crossover and mutation
         child_brain = self.brain.crossover(other.brain, crossover_rate=0.5)
-        child_brain.mutate(
-            mutation_rate=0.1, 
-            mutation_strength=0.2,
-            structural_mutation_rate=0.05,
-            activation_mutation_rate=0.05
-        )
+        mutation_type = random.uniform(0, 10)
+        if mutation_type > 4 and mutation_type < 8: #40% of the time give weight mutations, 40% only crossover, 20% give structural mutations (gotta have some freaks)
+            child_brain.mutate(
+                mutation_rate=0.1, 
+                mutation_strength=0.2,
+                structural_mutation_rate=0.05,
+                activation_mutation_rate=0.05
+            )
+        elif mutation_type >= 8:
+            child_brain.mutate(
+                mutation_rate=0.001, 
+                mutation_strength=0.2,
+                structural_mutation_rate=0.95,
+                activation_mutation_rate=0.005
+            )
 
         child_brain.reset_state()
         
@@ -1533,9 +1695,11 @@ class Agent:
         garden_bonus += self.gardens_harvested * 500  # Big bonus for farming
 
         resource_bonus = min(2000, food_score * water_score)
+
+        social_bonus = self.food_shared * 50
         
         #self.fitness = survival_score + food_score + water_score + resource_score + health_score + reproduction_score + complexity_bonus
-        self.fitness = survival_score + reproduction_score + complexity_bonus + garden_bonus + resource_bonus
+        self.fitness = survival_score + reproduction_score + complexity_bonus + garden_bonus + resource_bonus + social_bonus
         return self.fitness
 
 
@@ -1555,6 +1719,7 @@ class Environment:
         self.water: List[Water] = []
         self.gardens: List[Garden] = []
         self.timestep = 0
+        self.last_save_timestep = 0
         self.generation = 1
         self.next_agent_id = 0
 
@@ -1835,7 +2000,7 @@ class Environment:
             y = random.uniform(50, self.height - 50)
             
             # Random reservoir sizes
-            reservoir_size = random.choice([30, 40, 50, 60, 70, 80])
+            reservoir_size = random.choice([30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300, 310, 320, 330, 340, 350, 360, 370, 380, 390, 400])
             spectral_radius = random.uniform(0.85, 0.95)
             sparsity = random.uniform(0.05, 0.15)
             
@@ -2028,6 +2193,54 @@ class Environment:
                     continue
                 
                 if agent1.circle.is_colliding(agent2.circle):
+                        # === SOCIAL INTERACTIONS ===
+                    
+                    # Agent 1's intent towards Agent 2
+                    if agent1.current_intent < -0.5:
+                        # Agent 1 is hostile - damages Agent 2
+                        damage = 25.0
+                        agent2.health -= damage
+                        agent1.damage_dealt += damage
+                        agent2.damage_taken += damage
+                        # No fitness bonus for harming
+                        # Check if Agent 2 died from this attack
+                        if agent2.health <= 0 and agent2.alive:
+                            agent2.alive = False
+                            print(f"  💀 Agent {agent1.id} killed Agent {agent2.id} "
+                              f"(Gen {agent1.generation_born} vs Gen {agent2.generation_born}, "
+                              f"Age {agent2.age})")
+                        
+                    elif agent1.current_intent > 0.5 and agent1.food_inventory > 0:
+                        # Agent 1 is friendly - shares food with Agent 2
+                        agent1.food_inventory -= 1
+                        agent2.food_inventory += 1
+                        agent1.food_shared += 1
+                        agent2.food_received += 1
+                        agent1.fitness += 50  # Fitness bonus for sharing!
+                    
+                    # Agent 2's intent towards Agent 1
+                    if agent2.current_intent < -0.5:
+                        # Agent 2 is hostile - damages Agent 1
+                        damage = 25.0
+                        agent1.health -= damage
+                        agent2.damage_dealt += damage
+                        agent1.damage_taken += damage
+                        # No fitness bonus for harming
+                        # Check if Agent 2 died from this attack
+                        if agent1.health <= 0 and agent1.alive:
+                            agent1.alive = False
+                            print(f"  💀 Agent {agent2.id} killed Agent {agent1.id} "
+                              f"(Gen {agent2.generation_born} vs Gen {agent1.generation_born}, "
+                              f"Age {agent1.age})")
+                        
+                    elif agent2.current_intent > 0.5 and agent2.food_inventory > 0:
+                        # Agent 2 is friendly - shares food with Agent 1
+                        agent2.food_inventory -= 1
+                        agent1.food_inventory += 1
+                        agent2.food_shared += 1
+                        agent1.food_received += 1
+                        agent2.fitness += 50  # Fitness bonus for sharing!
+
                     # Simple elastic collision
                     agent1.circle.velocity_x, agent2.circle.velocity_x = \
                         agent2.circle.velocity_x * 0.8, agent1.circle.velocity_x * 0.8
@@ -2558,7 +2771,7 @@ class Environment:
         return close_rect  # Return for click detection
 
     def _render_recurrent_brain(self, screen, brain: RecurrentNeuralNetwork, 
-                            panel_x: int, panel_y: int, panel_width: int, panel_height: int, font):
+                        panel_x: int, panel_y: int, panel_width: int, panel_height: int, font):
         """Render recurrent neural network with reservoir visualization."""
         import pygame
         
@@ -2585,34 +2798,50 @@ class Environment:
         else:
             input_values = np.zeros(input_size)
         
-        # Input node labels - MATCHED TO YOUR ACTUAL INPUTS
-        input_labels = [
-            "∠Food 1",      # 0: Angle to nearest food
-            "∠Food 2",      # 1: Angle to second nearest food
-            "∠Water",       # 2: Angle to nearest water
-            "Water Dist",   # 3: Distance to nearest water
-            "∠Agent 1",     # 4: Angle to nearest agent
-            "∠Agent 2",     # 5: Angle to second nearest agent
-            "Wall Dist",        # 6: distance to nearest wall
-            "Health",       # 7: Health level (CHANGED)
-            "Food Lvl",     # 8: Food level
-            "Water Lvl",    # 9: Water level
-            "Inventory",    # 10: Food inventory
-            "∠Garden",      # 11: Angle to nearest garden
-            "Garden St",    # 12: Nearest garden state
-            "Bias",         # 13: Bias input
-        ]
+        # Input node labels - UPDATED FOR 54 INPUTS
+        input_labels = []
+        
+        # 8 sectors × 6 values = 48 inputs
+        sector_names = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]
+        for i, sector in enumerate(sector_names):
+            input_labels.append(f"{sector}:Food")
+            input_labels.append(f"{sector}:Watr")
+            input_labels.append(f"{sector}:Agnt")
+            input_labels.append(f"{sector}:Intnt")
+            input_labels.append(f"{sector}:Grdn")
+            input_labels.append(f"{sector}:GStat")
+        
+        # Self-state inputs (6)
+        input_labels.extend([
+            "Health",
+            "Food Lvl",
+            "Water Lvl",
+            "Inventory",
+            "Wall Dist",
+            "Rel Age",
+            "Bias"
+        ])
         
         # Ensure we have enough labels
         while len(input_labels) < input_size:
             input_labels.append(f"Input {len(input_labels)}")
         
-        # Draw Input Nodes (vertically spaced)
-        input_spacing = min(content_height / (input_size + 1), 30)
-        input_start_y = content_y + (content_height - input_spacing * input_size) // 2
+        # Draw Input Nodes (vertically spaced, scrollable if needed)
+        max_visible_inputs = 100  # Show up to 25 inputs
+        input_spacing = min(content_height / (max_visible_inputs + 1), 20)
         
+        if input_size > max_visible_inputs:
+            # Show only first max_visible_inputs and indicate more exist
+            visible_inputs = max_visible_inputs - 1
+            show_more_indicator = True
+        else:
+            visible_inputs = input_size
+            show_more_indicator = False
+        
+        input_start_y = content_y + 10
         input_positions = []
-        for i in range(input_size):
+        
+        for i in range(visible_inputs):
             y = input_start_y + i * input_spacing
             
             # Color based on input value
@@ -2628,17 +2857,23 @@ class Environment:
             
             input_positions.append((input_x, y))
             
-            # Draw input label
+            # Draw input label (make font smaller for readability)
             if i < len(input_labels):
-                label = font.render(input_labels[i], True, (200, 200, 200))
-                screen.blit(label, (input_x - 70, y - 6))
+                label = font.render(input_labels[i], True, (180, 180, 180))
+                screen.blit(label, (input_x - 80, y - 6))
                 
                 # Draw value (smaller, on right of node)
-                value_text = font.render(f"{input_val:.2f}", True, (150, 150, 150))
+                value_text = font.render(f"{input_val:.2f}", True, (130, 130, 130))
                 screen.blit(value_text, (input_x + 10, y - 6))
         
+        # Show "..." indicator if there are more inputs
+        if show_more_indicator:
+            y = input_start_y + visible_inputs * input_spacing
+            more_text = font.render(f"... +{input_size - visible_inputs} more", True, (150, 150, 150))
+            screen.blit(more_text, (input_x - 70, y - 6))
+        
         # Sample reservoir nodes if too many - FIX: Ensure indices are valid
-        max_display_nodes = 40
+        max_display_nodes = 500
         if reservoir_size > max_display_nodes:
             # Sample evenly, ensuring we don't exceed reservoir_size - 1
             display_indices = [min(int(i * reservoir_size / max_display_nodes), reservoir_size - 1) 
@@ -2650,9 +2885,6 @@ class Environment:
         else:
             display_indices = list(range(reservoir_size))
             display_size = reservoir_size
-        
-        # Debug print
-        #print(f"Reservoir size: {reservoir_size}, Display indices: {len(display_indices)}, Max index: {max(display_indices) if display_indices else 'N/A'}")
         
         # Draw Reservoir Nodes (circular arrangement)
         reservoir_center_y = content_y + content_height // 2
@@ -2683,7 +2915,7 @@ class Environment:
             if res_idx >= reservoir_size or res_idx < 0:
                 continue
                 
-            for inp_idx in range(input_size):
+            for inp_idx in range(min(visible_inputs, input_size)):  # Only draw connections to visible inputs
                 # Check array bounds
                 if res_idx < brain.input_weights.shape[0] and inp_idx < brain.input_weights.shape[1]:
                     weight = brain.input_weights[res_idx, inp_idx]  # [reservoir, input]
@@ -2783,7 +3015,7 @@ class Environment:
                 brain.output_activations[j]
             )[0]
         
-        output_labels = ["Angle", "Speed", "Eat", "Garden", "Plant", "Water"]
+        output_labels = ["Angle", "Speed", "Intent", "Garden", "Plant", "Water"]
         output_positions = []
         
         for i in range(output_size):
@@ -2816,7 +3048,7 @@ class Environment:
                 # Check array bounds
                 # output_weights shape is (reservoir_size, output_size)
                 if res_idx < brain.output_weights.shape[0] and out_idx < brain.output_weights.shape[1]:
-                    weight = brain.output_weights[res_idx, out_idx]  # FIXED: [reservoir, output]
+                    weight = brain.output_weights[res_idx, out_idx]
                     if abs(weight) > 0.001:
                         output_connections.append((res_idx, out_idx, weight))
 
@@ -3772,12 +4004,25 @@ class Simulation:
                     self.step()
                     timestep += 1
                 
-                # Auto-save on generation change
+                # === AUTO-SAVE LOGIC ===
+                current_gen = self.environment.generation
+                current_timestep = self.environment.timestep
+                last_save_timestep = self.environment.last_save_timestep
+                
+                # Method 1: Save on generation change (normal evolution)
                 if auto_save_interval > 0:
-                    current_gen = self.environment.generation
                     if current_gen > last_save_generation and current_gen % auto_save_interval == 0:
                         self.save_best_run(f'autosave_gen{current_gen}.pkl')
                         last_save_generation = current_gen
+                        last_save_timestep = current_timestep
+                
+                # Method 2: Save every 50k timesteps if stable (same generation for a long time)
+                # This handles the case where agents reproduce and maintain stable population
+                if current_timestep - last_save_timestep >= 50000:
+                    print(f"\n⏰ Stable population detected - auto-saving at timestep {current_timestep}")
+                    self.save_best_run(f'autosave_gen{current_gen}_t{current_timestep}.pkl')
+                    last_save_timestep = current_timestep
+                self.environment.last_save_timestep = last_save_timestep
                 
                 # Render
                 screen, font = self.environment.render(screen, font)
@@ -4168,7 +4413,7 @@ def run_simulation_with_saves():
     """
     Example: Run simulation with saving and loading.
     """
-    load_previous = True  # Set to True to continue from save
+    load_previous = False  # Set to True to continue from save
     # Create environment and simulation
     if load_previous:
         env = Environment(width=3000, height=3000, num_agents=30)
